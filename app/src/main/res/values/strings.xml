@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LiquidTab</string>
+    <string name="xposed_description">LiquidTab：完全离线的液态玻璃底栏模块。</string>
+</resources>

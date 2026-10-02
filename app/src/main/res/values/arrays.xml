@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <array name="xposedscope">
+        <item>tv.danmaku.bili</item>
+        <item>com.bilibili.app.in</item>
+        <item>com.sankuai.meituan.takeoutnew</item>
+        <item>com.sankuai.meituan</item>
+        <item>com.mi.health</item>
+        <item>com.xiaomi.market</item>
+        <item>com.xiaomi.vipaccount</item>
+        <item>com.xiaomi.smarthome</item>
+        <item>com.netease.cloudmusic</item>
+        <item>com.tencent.qqmusic</item>
+        <item>com.xingin.xhs</item>
+        <item>com.xunmeng.pinduoduo</item>
+        <item>com.taobao.taobao</item>
+        <item>com.ss.android.ugc.aweme</item>
+        <item>com.google.android.youtube</item>
+        <item>com.android.mms</item>
+        <item>com.tencent.mm</item>
+        <item>com.sina.weibo</item>
+        <item>com.baidu.tieba</item>
+        <item>com.cainiao.wireless</item>
+        <item>com.taobao.idlefish</item>
+        <item>com.jingyao.easybike</item>
+        <item>com.jingdong.app.mall</item>
+        <item>com.autonavi.minimap</item>
+        <item>com.supwisdom.xjtu</item>
+        <item>com.zhihu.android</item>
+    </array>
+</resources>

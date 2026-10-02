@@ -1,0 +1,55 @@
+package io.github.offlineglass.config
+
+import android.net.Uri
+
+object ConfigContract {
+    const val AUTHORITY = "io.github.offlineglass.settings"
+    val URI: Uri = Uri.parse("content://$AUTHORITY/config")
+
+    const val METHOD_GET = "get"
+    const val METHOD_REPORT_ACTIVE = "report_active"
+    const val METHOD_REPORT_NAVIGATION = "report_navigation"
+    const val KEY_NAVIGATION_LABELS = "navigation_labels"
+    const val METHOD_SNAPSHOT = "snapshot"
+    const val METHOD_MI_MARKET_TAB_GET = "mi_market_tab_get"
+    const val METHOD_MI_MARKET_TAB_SET = "mi_market_tab_set"
+
+    const val ACTION_CONFIG_REQUEST = "io.github.offlineglass.action.CONFIG_REQUEST"
+    const val ACTION_CONFIG_RESPONSE = "io.github.offlineglass.action.CONFIG_RESPONSE"
+    const val EXTRA_REQUEST_PACKAGE = "request_package"
+    const val CONFIG_SYNC_PERMISSION = "io.github.offlineglass.permission.CONFIG_SYNC"
+
+    const val KEY_PACKAGE = "package"
+    const val KEY_ENABLED = "enabled"
+    const val KEY_NATIVE_BLUR = "native_blur"
+    const val KEY_THEME_MODE = "theme_mode"
+    const val KEY_TAB_WIDTH = "tab_width"
+    const val KEY_BOTTOM_PADDING = "bottom_padding"
+    const val KEY_BLUR_RADIUS = "blur_radius"
+    const val KEY_CORNER_RADIUS = "corner_radius"
+    const val KEY_CORNER_RADIUS_PERCENT = "corner_radius_percent"
+    const val KEY_CORNER_SMOOTHING = "corner_smoothing"
+    const val KEY_BAR_HEIGHT = "bar_height"
+    const val KEY_LIGHT_ALPHA = "light_alpha"
+    const val KEY_DARK_ALPHA = "dark_alpha"
+    const val KEY_DARK_BAR_HIGHLIGHT_STRENGTH = "dark_bar_highlight_strength"
+    const val KEY_ICON_SCALE = "icon_scale"
+    const val KEY_TEXT_SIZE = "text_size"
+    const val KEY_ICON_ONLY = "icon_only"
+    const val KEY_HIDDEN_MASK = "hidden_mask"
+    const val KEY_SHOW_POST = "show_post"
+    const val KEY_CUSTOM_ACCENT_ENABLED = "custom_accent_enabled"
+    const val KEY_CUSTOM_ACCENT_COLOR = "custom_accent_color"
+    const val KEY_SHOW_CHANNEL = "show_channel"
+    const val KEY_BACKDROP_CAPTURE = "backdrop_capture"
+    const val KEY_SELECTED_ACCENT = "selected_accent"
+    const val KEY_LIQUID_GLASS_ENABLED = "liquid_glass_enabled"
+    const val KEY_BOTTOM_GRADIENT_BLUR_ENABLED = "bottom_gradient_blur_enabled"
+    const val KEY_SOLID_BAR_ENABLED = "solid_bar_enabled"
+    const val KEY_OUTLINE_ENABLED = "outline_enabled"
+    const val KEY_CLASSIC_NAVIGATION = "classic_navigation"
+    const val KEY_LAST_ACTIVE_PACKAGE = "last_active_package"
+    const val KEY_LAST_ACTIVE_TIME = "last_active_time"
+    const val KEY_SYSTEM_DARK = "system_dark"
+    const val KEY_MI_MARKET_TAB_ENABLED = "mi_market_tab_enabled"
+}
