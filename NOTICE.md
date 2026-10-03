@@ -20,3 +20,17 @@ provided by the user's LSPosed installation; LSPosed itself is not bundled.
 Dependency versions are declared in `app/build.gradle.kts`. Their upstream
 license texts and notices remain authoritative. No dependency source tree or
 binary archive is redistributed in this repository.
+
+## Rendering attribution: Kyant0 / AndroidLiquidGlass
+
+Special thanks to Kyant (kyant0), author of AndroidLiquidGlass (Backdrop):
+https://github.com/Kyant0/AndroidLiquidGlass
+
+LiquidTab's liquid-glass refraction implementation draws on and adapts this
+project's open-source rendering work. These upstream contributions are not
+claimed as original LiquidTab work. AndroidLiquidGlass is licensed under the
+Apache License 2.0; the license text is included at `licenses/Apache-2.0.txt`.
+Attribution does not mean that the complete upstream library is bundled, or
+that all blur, highlighting, native View integration and app adaptation code
+originates from this one project. Preserve upstream copyright and license
+headers wherever upstream source is adapted.
