@@ -1,6 +1,13 @@
 # LiquidTab
 
+
 LiquidTab 是适用于 LSPosed 的 Android 液态底栏模块。2.0 版本包含模块管理界面、统一玻璃渲染核心和按应用目录组织的适配代码。应用 ID 保持为 `io.github.offlineglass`，用于兼容既有安装和本地设置。
+## 特别致谢：kyant0 / AndroidLiquidGlass
+
+特别感谢 [kyant0 的 AndroidLiquidGlass（Backdrop）](https://github.com/Kyant0/AndroidLiquidGlass)。LiquidTab 的液态玻璃折射方案参考、借鉴并改编了该项目的开源实现；这些上游贡献不应被视为 LiquidTab 独创。该项目采用 Apache License 2.0。
+
+LiquidTab 同时使用 Miuix、AndroidX 和 Android 原生渲染能力，并包含自身的原生 View 桥接、动态高光、生命周期管理和应用适配代码。因此，这里对液态玻璃来源明确致谢，但不将整个渲染系统笼统归为单一项目。具体许可见 [NOTICE.md](NOTICE.md)。
+
 
 ## 运行条件
 
