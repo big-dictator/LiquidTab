@@ -149,6 +149,8 @@ import de.robv.android.xposed.XC_MethodHook
 
 import io.github.offlineglass.config.GlassConfig
 
+import io.github.offlineglass.util.GlassLog
+
 import kotlin.math.abs
 
 import kotlin.math.ceil
@@ -1916,14 +1918,7 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
         super.onAttachedToWindow()
 
-        targetAdapter?.requestedFrameRateMax?.takeIf { Build.VERSION.SDK_INT >= 35 }?.let { maximum ->
-            val requestedRate = display?.supportedModes
-                ?.maxOfOrNull { it.refreshRate }
-                ?.coerceAtMost(maximum)
-                ?: maximum
-            setRequestedFrameRate(requestedRate)
-            appNavigationState?.logDiagnostic("requested frame rate=$requestedRate")
-        }
+        updateRequestedFrameRate()
 
         context.findActivity()?.let { activity ->
 
@@ -2259,6 +2254,8 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
         updateBloomTiltRegistration()
 
+        updateRequestedFrameRate()
+
     }
 
 
@@ -2267,6 +2264,8 @@ internal val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat(
 
         if (targetAdapter?.requestedFrameRateMax != null && Build.VERSION.SDK_INT >= 35) {
             setRequestedFrameRate(0f)
+            appliedRequestedFrameRate = 0f
+            highRefreshRateCache = 0f
         }
 
         if (context.packageName == MI_THEME_PACKAGE ||
@@ -3419,6 +3418,8 @@ internal fun syncOpticalVisibilityCompanions() {
 
         glassPerfRecord(perfT1 - perfT0, perfT2 - perfT1)
 
+        updateRequestedFrameRate()
+
         // Weibo renders feed video through a compositor-backed texture. Those
 
         // texture frames do not necessarily invalidate the surrounding Android
@@ -3439,7 +3440,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         ) {
 
-            postInvalidateOnAnimation()
+            requestDisplayRatePump()
 
         }
 
@@ -3451,7 +3452,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
         ) {
 
-            postInvalidateOnAnimation()
+            requestDisplayRatePump()
 
         }
 
@@ -3467,13 +3468,95 @@ internal fun syncOpticalVisibilityCompanions() {
 
         ) {
 
-            postInvalidateOnAnimation()
+            requestDisplayRatePump()
 
         }
 
     }
 
 
+
+    private var lastFramePumpUptimeMs = 0L
+
+    private val framePumpMinIntervalMs = 16L
+
+    private var appliedRequestedFrameRate = Float.NaN
+
+    private var highRefreshRateCache = 0f
+
+    /**
+     * Live-scene pumps used to invalidate on every vsync, which on a 120 Hz
+     * panel means 120 glass redraws per second even though the sampled content
+     * is at most 60 fps. Cap the pump at 60 Hz: the backdrop still tracks any
+     * real content, while the redundant frames (and the captures they trigger)
+     * disappear. The bar's own indicator/press springs are independent of this
+     * path and keep animating at display rate.
+     */
+    private fun requestDisplayRatePump() {
+
+        val now = SystemClock.uptimeMillis()
+
+        if (now - lastFramePumpUptimeMs < framePumpMinIntervalMs) return
+
+        lastFramePumpUptimeMs = now
+
+        postInvalidateOnAnimation()
+
+    }
+
+    /**
+     * Vote for a high refresh rate only while something is actually moving.
+     * Previously the vote was cast once on attach and held until detach, which
+     * pinned the whole panel at 120 Hz for as long as the bar existed, static
+     * scene or not. Idle scenes now drop the vote and let the system pick the
+     * cheapest rate; touch, spring motion, page transitions and content scroll
+     * raise it again on the next drawn frame.
+     */
+    private fun updateRequestedFrameRate() {
+
+        val maximum = targetAdapter?.requestedFrameRateMax ?: return
+
+        if (Build.VERSION.SDK_INT < 35) return
+
+        val wantsHighRate = isShown && hasWindowFocus() && visibility == View.VISIBLE &&
+
+            (touching || pressProgress > 0.001f || barVisibilityAnimating ||
+
+                abs(indicatorPosition - dragTarget) > 0.001f ||
+
+                (appNavigationState?.contentMotionHoldUntil() ?: 0L) > SystemClock.uptimeMillis())
+
+        val rate = if (wantsHighRate) {
+
+            if (highRefreshRateCache == 0f) {
+
+                highRefreshRateCache = display?.supportedModes
+
+                    ?.maxOfOrNull { it.refreshRate }
+
+                    ?.coerceAtMost(maximum)
+
+                    ?: maximum
+
+            }
+
+            highRefreshRateCache
+
+        } else {
+
+            0f
+
+        }
+
+        if (appliedRequestedFrameRate == rate) return
+
+        appliedRequestedFrameRate = rate
+
+        setRequestedFrameRate(rate)
+
+        appNavigationState?.logDiagnostic("requested frame rate=$rate")
+
+    }
 
     /** One geometry rule for every app: the bar radius follows its real height. */
 
@@ -3817,6 +3900,8 @@ internal fun syncOpticalVisibilityCompanions() {
 
     private fun glassPerfRecord(prepareNs: Long, panelNs: Long) {
 
+        if (!GlassLog.enabled) return
+
         perfFrames++
 
         perfPrepareNs += prepareNs
@@ -3834,6 +3919,8 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
     private fun glassPerfLogTick() {
+
+        if (!GlassLog.enabled) return
 
         val now = SystemClock.uptimeMillis()
 
@@ -3898,6 +3985,8 @@ internal fun syncOpticalVisibilityCompanions() {
 
 
     private fun glassDispatchPerfRecord(dispatchNs: Long) {
+
+        if (!GlassLog.enabled) return
 
         perfDispatchNs += dispatchNs
 
@@ -4716,7 +4805,7 @@ internal fun syncOpticalVisibilityCompanions() {
 
     private fun logGeometryIfChanged(reason: String, force: Boolean = false) {
 
-        if (context.packageName != QQ_PACKAGE) return
+        if (!GlassLog.enabled || context.packageName != QQ_PACKAGE) return
 
         val hostLocation = IntArray(2).also { runCatching { getLocationInWindow(it) } }
 
@@ -10306,9 +10395,9 @@ internal fun drawOuterGlass(canvas: Canvas) {
         )
         if (sourceRect.width() <= 0 || sourceRect.height() <= 0) return
         val targetWidth = captureGeometry?.targetWidth
-            ?: max(1, (sourceRect.width() / CAPTURE_DOWNSCALE).roundToInt())
+            ?: max(1, (sourceRect.width() / captureDownscale()).roundToInt())
         val targetHeight = captureGeometry?.targetHeight
-            ?: max(1, (sourceRect.height() / CAPTURE_DOWNSCALE).roundToInt())
+            ?: max(1, (sourceRect.height() / captureDownscale()).roundToInt())
         val requestedBarSource = captureGeometry?.barSource
         val current = backdrop
         val reusable = opticalSurfaceRootCopyScratch?.takeIf {
@@ -12297,9 +12386,9 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
 
 
 
-        val targetWidth = max(1, sourceRect.width() / CAPTURE_DOWNSCALE.toInt())
+        val targetWidth = max(1, sourceRect.width() / captureDownscale().toInt())
 
-        val targetHeight = max(1, sourceRect.height() / CAPTURE_DOWNSCALE.toInt())
+        val targetHeight = max(1, sourceRect.height() / captureDownscale().toInt())
 
         val target = opticalSurfacePixelCopyScratch
 
@@ -12419,6 +12508,17 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
 
 
 
+    /**
+     * Backdrop sampling resolution. The capture is only ever seen through the
+     * glass blur + refraction chain, so a coarser source is hard to notice at
+     * normal blur radii while cutting software rasterisation and PixelCopy
+     * readback pixels by roughly 44% (2x -> 3x). Near-zero blur shows the raw
+     * capture instead, so keep the sharper setting there to protect text and
+     * icon edges behind the bar.
+     */
+    private fun captureDownscale(): Float =
+        if (config.blurRadius < 1.5f) DOWNSCALE_SHARP else DOWNSCALE_BLURRED
+
     private fun captureBackdrop(root: View) {
         // Check every software-capture entry, including the idle fallback.
         // GPU-only app images may throw while an otherwise ordinary View draws.
@@ -12431,9 +12531,9 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
 
         val captureHeight = height + padding * 2f
 
-        val scaledWidth = max(1, (captureWidth / CAPTURE_DOWNSCALE).toInt())
+        val scaledWidth = max(1, (captureWidth / captureDownscale()).toInt())
 
-        val scaledHeight = max(1, (captureHeight / CAPTURE_DOWNSCALE).toInt())
+        val scaledHeight = max(1, (captureHeight / captureDownscale()).toInt())
 
         val target = backdrop?.takeIf { it.width == scaledWidth && it.height == scaledHeight && !it.isRecycled }
 
@@ -12467,7 +12567,7 @@ internal fun surfaceContainerColor(dark: Boolean): Int {
 
             bitmapCanvas.drawColor(Color.TRANSPARENT, BlendMode.CLEAR)
 
-            bitmapCanvas.scale(1f / CAPTURE_DOWNSCALE, 1f / CAPTURE_DOWNSCALE)
+            bitmapCanvas.scale(1f / captureDownscale(), 1f / captureDownscale())
 
             bitmapCanvas.translate(-x.toFloat() + padding, -y.toFloat() + padding)
 
@@ -13319,7 +13419,9 @@ internal fun isDarkGlass(): Boolean {
 
         const val PRESSED_SCALE = 78f / 56f
 
-        const val CAPTURE_DOWNSCALE = 2f
+        const val DOWNSCALE_SHARP = 2f
+
+        const val DOWNSCALE_BLURRED = 3f
 
 
         // Fallback sampling runs from pre-draw, so it must track rendered frames.

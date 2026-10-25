@@ -6,6 +6,7 @@ import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
 import android.os.Bundle
+import io.github.offlineglass.util.GlassLog
 
 class SettingsProvider : ContentProvider() {
     override fun onCreate(): Boolean {
@@ -17,7 +18,7 @@ class SettingsProvider : ContentProvider() {
 
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
         val context = requireNotNull(context)
-        if (method == ConfigContract.METHOD_GET) {
+        if (GlassLog.enabled && method == ConfigContract.METHOD_GET) {
             android.util.Log.i(
                 "LiquidTabUI",
                 "providerCall isDE=${context.isDeviceProtectedStorage} " +
