@@ -5,8 +5,10 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
+import io.github.offlineglass.hook.adapters.NavigationLabelLocalization
 
 internal class WeChatTabsRenderer {
+    private val focusFields = HashMap<Class<*>, java.lang.reflect.Field?>()
     private data class WeChatTabViews(
         val icon: View?,
         val label: TextView?,
@@ -17,85 +19,118 @@ internal class WeChatTabsRenderer {
 
     private var weChatCachedTabs: List<WeChatTabViews>? = null
     private var weChatTabsCacheSource: View? = null
+    private var foregroundResources: android.content.res.Resources? = null
+    private var foregroundColorId = 0
+    private val textBounds = android.graphics.Rect()
+    private val labelPaint = android.text.TextPaint()
+    private val badgePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.RED
+    }
+    private val badgeTextPaint = android.text.TextPaint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.WHITE
+        isFakeBoldText = true
+    }
 
-    fun draw(canvas: Canvas, source: ViewGroup, density: Float) {
+    private fun belongsTo(view: View?, parent: ViewGroup): Boolean {
+        var current = view ?: return true
+        repeat(16) {
+            if (current === parent) return true
+            current = current.parent as? View ?: return false
+        }
+        return false
+    }
 
-        val inner = (0 until source.childCount)
+    fun draw(canvas: Canvas, source: ViewGroup, density: Float, configIconScale: Float = 1f,
+             selectedArtwork: Boolean? = null, dark: Boolean = false, managerEnglishLabels: Boolean = false,
+             iconOnly: Boolean = false, hostHeight: Float? = null, hostWidth: Int = source.width) {
 
-            .map { source.getChildAt(it) }
+        var remaining = 256
+        fun findTabs(root: ViewGroup, depth: Int = 0): List<ViewGroup>? {
+            if (depth >= 16 || remaining-- <= 0) return null
+            if (root.childCount == 4) {
+                val candidates = (0 until root.childCount).mapNotNull { root.getChildAt(it) as? ViewGroup }
+                if (candidates.size == 4 && candidates.all { tab ->
+                        val stack = ArrayDeque<View>()
+                        stack += tab
+                        var hasIcon = false
+                        var hasLabel = false
+                        while (stack.isNotEmpty() && remaining-- > 0) {
+                            val view = stack.removeLast()
+                            if (view.javaClass.simpleName == "TabIconView") hasIcon = true
+                            if (view is TextView) hasLabel = true
+                            if (view is ViewGroup) for (i in 0 until view.childCount) stack += view.getChildAt(i)
+                        }
+                        hasIcon && hasLabel
+                    }) return candidates
+            }
+            for (i in 0 until root.childCount) {
+                val child = root.getChildAt(i) as? ViewGroup ?: continue
+                findTabs(child, depth + 1)?.let { return it }
+            }
+            return null
+        }
+        val tabs = weChatCachedTabs?.takeIf { cached ->
+            val parent = cached.firstOrNull()?.tab?.parent as? ViewGroup
+            weChatTabsCacheSource === source && parent != null && parent.childCount == 4 &&
+                belongsTo(parent, source) && cached.indices.all { index ->
+                    val tab = cached[index]
+                    parent.getChildAt(index) === tab.tab && tab.tab.isAttachedToWindow &&
+                        belongsTo(tab.icon, tab.tab) && belongsTo(tab.label, tab.tab) &&
+                        belongsTo(tab.badgeDot, tab.tab) && belongsTo(tab.badgeCount, tab.tab)
+                }
+        } ?: run {
+            val tabViews = findTabs(source) ?: return
+            buildList {
+                for (tab in tabViews) {
 
-            .filterIsInstance<ViewGroup>()
+                    var iconView: View? = null
 
-            .firstOrNull { it.childCount >= 3 }
+                    var labelView: TextView? = null
 
-            ?: return
+                    var badgeDot: ImageView? = null
 
-        val tabCount = inner.childCount
+                    var badgeCount: TextView? = null
 
-        if (tabCount <= 0) return
+                    val stack = ArrayDeque<View>()
 
+                    stack += tab
 
+                    while (stack.isNotEmpty() && remaining-- > 0) {
 
-        // Use cached tab references or rebuild cache
+                        val v = stack.removeLast()
 
-        val tabs = weChatCachedTabs?.takeIf {
+                        val name = v.javaClass.simpleName
 
-            weChatTabsCacheSource === source && it.size == tabCount &&
+                        when {
 
-                it.all { tc -> tc.tab.isAttachedToWindow }
+                            name == "TabIconView" -> iconView = v
 
-        } ?: buildList {
+                            name == "ImageView" -> if (badgeDot == null) badgeDot = v as? ImageView
 
-            for (i in 0 until tabCount) {
+                            v is TextView -> {
 
-                val tab = inner.getChildAt(i) as? ViewGroup ?: continue
+                                if (labelView == null) labelView = v
 
-                var iconView: View? = null
+                                else if (badgeCount == null) badgeCount = v as? TextView
 
-                var labelView: TextView? = null
+                            }
 
-                var badgeDot: ImageView? = null
+                        }
 
-                var badgeCount: TextView? = null
+                        if (v is ViewGroup) {
 
-                val stack = ArrayDeque<View>()
-
-                stack += tab
-
-                while (stack.isNotEmpty()) {
-
-                    val v = stack.removeLast()
-
-                    val name = v.javaClass.simpleName
-
-                    when {
-
-                        name == "TabIconView" -> iconView = v
-
-                        name == "ImageView" -> if (badgeDot == null) badgeDot = v as? ImageView
-
-                        v is TextView -> {
-
-                            if (labelView == null) labelView = v
-
-                            else if (badgeCount == null) badgeCount = v as? TextView
+                            for (j in 0 until v.childCount) stack += v.getChildAt(j)
 
                         }
 
                     }
 
-                    if (v is ViewGroup) {
-
-                        for (j in 0 until v.childCount) stack += v.getChildAt(j)
-
-                    }
+                    if (stack.isNotEmpty() || iconView == null || labelView == null) return
+                    add(WeChatTabViews(iconView, labelView, badgeDot, badgeCount, tab))
 
                 }
 
-                add(WeChatTabViews(iconView, labelView, badgeDot, badgeCount, tab))
-
             }
-
         }.also {
 
             weChatCachedTabs = it
@@ -105,6 +140,8 @@ internal class WeChatTabsRenderer {
         }
 
 
+
+        val tabCount = tabs.size
 
         // slotTransform already centers source content within the pill.
 
@@ -116,17 +153,22 @@ internal class WeChatTabsRenderer {
 
         val firstIcon = tabs.firstOrNull { it.icon != null }?.icon
 
-        val iconSize = firstIcon?.width?.toFloat() ?: (40f * density)
+        val iconScale = 1.15f * 1.1f * configIconScale
+        val iconSize = (firstIcon?.height?.takeIf { it > 0 }?.toFloat()
+            ?: (40f * density)) * iconScale
 
         val labelH = tabs.firstOrNull { it.label != null }?.label?.let {
 
-            val tp = android.text.TextPaint(it.paint)
-
-            tp.descent() - tp.ascent()
+            val bounds = textBounds
+            val text = it.text.toString()
+            it.paint.getTextBounds(text, 0, text.length, bounds)
+            bounds.height().toFloat()
 
         } ?: (12f * density)
 
-        val gap = 3f * density
+        // Position the visible glyphs, not the font's extra ascent/descent
+        // space. Native icon bitmaps already contain transparent edge padding.
+        val gap = 0f
 
         val totalH = iconSize + gap + labelH
 
@@ -134,7 +176,8 @@ internal class WeChatTabsRenderer {
 
         val pillH = source.height.toFloat()
 
-        val baseY = (pillH - totalH) * 0.5f
+        // Move the icon/label group together; badges keep their row anchor.
+        val baseY = if (iconOnly) ((hostHeight ?: pillH) - iconSize) * 0.5f else (pillH - totalH) * 0.5f - 2f * density
 
         val iconCenterY = baseY + iconSize * 0.5f
 
@@ -142,9 +185,21 @@ internal class WeChatTabsRenderer {
 
 
 
-        val tabWidth = source.width.toFloat() / tabCount
+        val tabWidth = hostWidth.toFloat() / tabCount
 
 
+
+        val normalLabelColor = if (selectedArtwork == false && !iconOnly) {
+            val resources = source.resources
+            if (foregroundResources !== resources) {
+                foregroundResources = resources
+                foregroundColorId = resources.getIdentifier("FG_0", "color", "com.tencent.mm")
+            }
+            val fallback = if (dark) android.graphics.Color.WHITE else 0xFF191919.toInt()
+            if (foregroundColorId != 0) runCatching {
+                resources.getColor(foregroundColorId, source.context.theme)
+            }.getOrDefault(fallback) else fallback
+        } else if (dark) android.graphics.Color.WHITE else 0xFF191919.toInt()
 
         for ((idx, tc) in tabs.withIndex()) {
 
@@ -170,23 +225,34 @@ internal class WeChatTabsRenderer {
 
                 canvas.save()
 
+                // Match the scaled height used by the centred icon/label layout.
+                // Badge coordinates remain independently anchored to the row.
                 canvas.translate(tx, ty)
+                canvas.scale(iconScale, iconScale, iW * 0.5f, iH * 0.5f)
 
-                // Enlarge icons to 1.15x around their own centre; text and
+                // Direct View.draw uses the local canvas. The parent normally
+                // applies the View's alpha and visibility when drawing a child.
 
-                // notification badge keep their original size and position.
-
-                canvas.scale(1.15f, 1.15f, iW * 0.5f, iH * 0.5f)
-
-                val savedAlpha = icon.alpha
-
-                icon.alpha = 1f
-
-                icon.visibility = View.VISIBLE
-
-                icon.draw(canvas)
-
-                icon.alpha = savedAlpha
+                // Decompiled TabIconView.onDraw blends three native bitmaps
+                // using its single declared int (setFocusAlpha's backing field).
+                // Record the real endpoint artwork, then restore native state
+                // without invoking selection or invalidating WeChat's controller.
+                val focus = if (selectedArtwork != null) {
+                    val type = icon.javaClass
+                    if (!focusFields.containsKey(type)) {
+                        focusFields[type] = type.declaredFields.singleOrNull {
+                            it.type == Int::class.javaPrimitiveType && !java.lang.reflect.Modifier.isStatic(it.modifiers)
+                        }?.apply { isAccessible = true }
+                    }
+                    focusFields[type]
+                } else null
+                val nativeFocus = focus?.getInt(icon)
+                try {
+                    if (nativeFocus != null) focus.setInt(icon, if (selectedArtwork == true) 255 else 0)
+                    icon.draw(canvas)
+                } finally {
+                    if (nativeFocus != null) focus.setInt(icon, nativeFocus)
+                }
 
                 canvas.restore()
 
@@ -196,25 +262,32 @@ internal class WeChatTabsRenderer {
 
                 val label = tc.label
 
-                if (label != null) {
+                if (label != null && (!iconOnly || tc.icon == null)) {
 
                     val text = label.text
 
                     if (text != null && text.isNotEmpty()) {
 
-                        val tp = android.text.TextPaint(label.paint)
+                        val tp = labelPaint.apply { set(label.paint) }
 
-                        tp.color = label.currentTextColor
+                        tp.color = when (selectedArtwork) {
+                            true -> 0xFF07C160.toInt()
+                            false -> normalLabelColor
+                            null -> label.currentTextColor
+                        }
 
                         tp.alpha = 255
 
-                        val s = text.toString()
+                        val nativeText = text.toString()
+                        val s = if (managerEnglishLabels) NavigationLabelLocalization.toEnglish("wechat", nativeText) else nativeText
 
                         val tw = tp.measureText(s)
 
                         val lx = centerX - tw * 0.5f
 
-                        val ly = textCenterY + (tp.descent() - tp.ascent()) * 0.5f - tp.descent()
+                        val bounds = textBounds
+                        tp.getTextBounds(s, 0, s.length, bounds)
+                        val ly = textCenterY - (bounds.top + bounds.bottom) * 0.5f
 
                         canvas.drawText(s, lx, ly, tp)
 
@@ -238,23 +311,15 @@ internal class WeChatTabsRenderer {
 
                         val bx = centerX + iW * 0.5f - 4f * density
 
-                        // Badge top edge slightly below pill top edge
+                        // Anchor the badge's top to the row, just below the
+                        // selection's 4dp top inset, independently of icon size.
 
-                        val by = iconCenterY - iH * 0.1875f
+                        val by = br + 6f * density
 
-                        val bp = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+                        canvas.drawCircle(bx, by, br, badgePaint)
 
-                        bp.color = android.graphics.Color.RED
-
-                        canvas.drawCircle(bx, by, br, bp)
-
-                        val cp = android.text.TextPaint(android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG))
-
-                        cp.color = android.graphics.Color.WHITE
-
-                        cp.textSize = cnt.textSize.toFloat()
-
-                        cp.isFakeBoldText = true
+                        val cp = badgeTextPaint
+                        cp.textSize = cnt.textSize
 
                         val cs = text.toString()
 

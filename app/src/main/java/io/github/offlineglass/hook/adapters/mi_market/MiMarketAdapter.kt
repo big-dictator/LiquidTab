@@ -5,32 +5,96 @@ import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 import io.github.offlineglass.config.ConfigContract
 import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.HookCoordinator
 import io.github.offlineglass.hook.adapters.TargetAdapter
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.NavigationCandidate
+import io.github.offlineglass.hook.NavigationFinder
+import java.lang.ref.WeakReference
+import java.util.WeakHashMap
 import io.github.offlineglass.targets.TargetSpec
 
 /** Xiaomi Market's native-tab binding and settings synchronization. */
 internal object MiMarketAdapter : TargetAdapter {
     override val key = "mi_market"
+    override val ownsNavigationFinding = true
     override val ownsNavigationDrawing = true
     override val ownsNavigationTap = true
     override val hideRedrawnNavigationSource = true
     override val usesContentDarkMode = true
-    override fun createNavigationState(context: android.content.Context): AppNavigationState =
-        MiMarketNavigationState(context)
     override val managesNativeTabVisibility = true
+    override val skipBackdropStableDelay = true
+    override val usesDirectOpticalBackdropMode = true
+    override val usesOpticalSurfacePipeline = true
+    override val countsOpticalCompositorCopies = true
+    override val keepsOpticalSurfaceDuringBarAnimation = true
+    // Shadow mask reaches 3.5 * 10dp, with additional posture/press expansion.
+    override val opticalSurfaceOverflowDp = 48f
+    override val deferCompanionRemovalOnDetach = true
+    override val releaseOutlineClipping = true
+    override val allowsSystemBackgroundBlur = false
+    override val reuseOpticalBlur = true
+    override val reuseSurfaceBlurDuringBarAnimation = true
+
+    override fun opticalCaptureGeometry(
+        rootWidth: Int, rootHeight: Int, left: Int, top: Int, width: Int, height: Int, padding: Int,
+    ): io.github.offlineglass.hook.adapters.OpticalCaptureGeometry? {
+        val rect = android.graphics.Rect(
+            (left - padding).coerceAtLeast(0), (top - padding).coerceAtLeast(0),
+            (left + width + padding).coerceAtMost(rootWidth),
+            (top + height + padding).coerceAtMost(rootHeight),
+        )
+        if (rect.isEmpty) return null
+        return io.github.offlineglass.hook.adapters.OpticalCaptureGeometry(
+            rect, rect.width(), rect.height(), android.graphics.Rect(0, 0, rect.width(), rect.height()),
+        )
+    }
+    override val accentColor: Int = 0xFFFF6900.toInt()
+    override val foregroundNavigationOverSelection = true
+    override val drawsNavigationInOptics = true
+    override val usesNavigationOpticalMix = true
+    override val persistentNavigationOpticalMix = true
+    override val foregroundMaskInsetDp = 0f
+    override val suppressPlatformElevation = true
+    override val continuousIndicatorMask = true
+    override val actionOnlyIndices = setOf(2)
+    override val observeWindowTouches = true
+    override fun onWindowTouch(host: View, event: android.view.MotionEvent) {
+        ((host as? io.github.offlineglass.hook.GlassHostLayout)?.appNavigationState as? MiMarketNavigationState)
+            ?.onSearchTouch(host, event)
+    }
+    override fun barLayout(config: GlassConfig, width: Int, height: Int, density: Float, slots: Int): io.github.offlineglass.hook.adapters.AdapterBarLayout? {
+        if (width <= height + 12f * density || height <= 0) return null
+        val actionLeft = width - height.toFloat()
+        return io.github.offlineglass.hook.adapters.AdapterBarLayout(
+            mainWidth = actionLeft - 12f * density, actionLeft = actionLeft,
+            actionSize = height.toFloat(), actionIndex = 2, navigationIndices = listOf(0, 1),
+            actionFillColor = accentColor, localActionOptics = true, localMainOptics = true,
+        )
+    }
     override fun normalizeConfig(config: GlassConfig): GlassConfig =
-        config.copy(hiddenMask = 0, iconOnly = false)
+        config.copy(hiddenMask = 0, iconOnly = false, detachedPublish = true)
     @Volatile private var syncingMiMarketNativePrefs = false
     @Volatile private var miMarketContext: android.content.Context? = null
+    private val navigationStates = WeakHashMap<Activity, WeakReference<MiMarketNavigationState>>()
     private val miMarketManagedPreferenceKeys = setOf("pref_key_short_play", "pref_key_mini_game")
+    private val miMarketTabPreferences = HashMap<String, Boolean>()
+
+    override fun createNavigationState(context: android.content.Context): AppNavigationState =
+        MiMarketNavigationState(context).also { state ->
+            (context as? Activity)?.let { activity -> navigationStates[activity] = WeakReference(state) }
+        }
+
+    override fun createNavigationState(
+        context: android.content.Context,
+        host: io.github.offlineglass.hook.GlassHostLayout,
+    ): AppNavigationState = createNavigationState(context)
 
     // The real tab container's children may not yet be clickable on first layout.
     override fun estimateSlotCount(group: ViewGroup, spec: TargetSpec): Int? =
@@ -39,13 +103,33 @@ internal object MiMarketAdapter : TargetAdapter {
     override fun adjustNavigationScore(view: ViewGroup, idName: String?, score: Int): Int =
         if (idName == "tab_container") score + 180 else score
 
+    override fun findNavigation(root: View, spec: TargetSpec): NavigationCandidate? {
+        val bottomTab = findMiMarketBottomTab(root) ?: return null
+        val row = (bottomTab as? ViewGroup)?.let { controller ->
+            if (controller.javaClass.name == MIUX4_BOTTOM_TAB_CLASS) {
+                runCatching { readInstanceField(controller, "bottomNavigator") as? ViewGroup }.getOrNull()
+            } else controller
+        } ?: return null
+        return NavigationCandidate(row, 3, 250)
+    }
+
+    override fun acceptsNavigationSource(navigation: ViewGroup): Boolean =
+        navigation.javaClass.name == "miuix.bottomnavigation.BottomNavigator" ||
+            navigation.javaClass.name == "com.xiaomi.market.widget.BottomTabLayout"
+
     override fun resolveNestedNavigation(navigation: ViewGroup): Pair<ViewGroup, Int>? {
+        if (navigation.javaClass.name == "com.xiaomi.market.widget.BottomTabLayoutMiux4") {
+            val row = runCatching {
+                readInstanceField(navigation, "bottomNavigator") as? ViewGroup
+            }.getOrNull() ?: return null
+            return row to 3
+        }
         if (resourceEntryName(navigation) == "tab_container") return null
         val stack = ArrayDeque<Pair<View, Int>>()
         stack += navigation to 0
         while (stack.isNotEmpty()) {
             val (view, depth) = stack.removeLast()
-            if (view is ViewGroup && resourceEntryName(view) == "tab_container") return view to 4
+            if (view is ViewGroup && resourceEntryName(view) == "tab_container") return view to 3
             if (view is ViewGroup && depth < 5) {
                 for (index in 0 until view.childCount) {
                     stack += view.getChildAt(index) to (depth + 1)
@@ -56,12 +140,30 @@ internal object MiMarketAdapter : TargetAdapter {
     }
 
     override fun installHooks(lpparam: XC_LoadPackage.LoadPackageParam, spec: TargetSpec) {
+        MiMarketUpgradeGlass.install()
+        MiMarketUpgradeRecommendations.install(lpparam.classLoader)
+        MiMarketProfileRecommendations.install(lpparam.classLoader)
+        MiMarketWebInsets.install(lpparam.classLoader)
         installMiMarketNavigationHooks(lpparam, spec)
     }
 
     private fun resourceEntryName(view: View): String? = runCatching {
         if (view.id == View.NO_ID) null else view.resources.getResourceEntryName(view.id)
     }.getOrNull()
+
+    private fun findMiMarketBottomTab(root: View): ViewGroup? {
+        val stack = ArrayDeque<Pair<View, Int>>()
+        stack += root to 0
+        var visited = 0
+        while (stack.isNotEmpty() && visited++ < 4_096) {
+            val (view, depth) = stack.removeLast()
+            if (view is ViewGroup && view.javaClass.name in MI_MARKET_BOTTOM_TAB_CLASSES) return view
+            if (view is ViewGroup && depth < 24) {
+                for (index in view.childCount - 1 downTo 0) stack += view.getChildAt(index) to (depth + 1)
+            }
+        }
+        return null
+    }
 
     override fun suppressNativeBottomChrome(navigation: ViewGroup) {
         navigation.background = ColorDrawable(Color.TRANSPARENT)
@@ -155,7 +257,6 @@ internal object MiMarketAdapter : TargetAdapter {
         lpparam: XC_LoadPackage.LoadPackageParam,
         spec: TargetSpec,
     ) {
-        installMiMarketPreferenceSyncHooks(lpparam)
         val wrapperClass = runCatching {
             XposedHelpers.findClass(
                 "com.xiaomi.market.ui.DoubleTabProxyActivityWrapper",
@@ -170,7 +271,9 @@ internal object MiMarketAdapter : TargetAdapter {
                 }.getOrNull()
                 if (bottomTab != null) {
                     miMarketContext = bottomTab.context
-                    syncMiMarketNativePreferences(lpparam.classLoader, bottomTab.context)
+                    (bottomTab.context as? Activity)?.let { activity ->
+                        (bottomTab as? ViewGroup)?.let { navigationStates[activity]?.get()?.bindBottomTab(it) }
+                    }
                     HookCoordinator.onNavigationView(bottomTab, spec)
                 } else {
                     val activity = runCatching {
@@ -178,7 +281,13 @@ internal object MiMarketAdapter : TargetAdapter {
                     }.getOrNull()
                     if (activity != null) {
                         miMarketContext = activity
-                        syncMiMarketNativePreferences(lpparam.classLoader, activity)
+                        val liveBottomTab = runCatching {
+                            XposedHelpers.callMethod(wrapper, "getTabViewMiux4") as? ViewGroup
+                                ?: XposedHelpers.callMethod(wrapper, "getTabView") as? ViewGroup
+                        }.getOrNull()
+                        if (liveBottomTab != null) {
+                            navigationStates[activity]?.get()?.bindBottomTab(liveBottomTab)
+                        }
                         HookCoordinator.onActivityResumed(activity, spec)
                     }
                 }
@@ -197,6 +306,32 @@ internal object MiMarketAdapter : TargetAdapter {
                     }
                 })
             }
+        }
+
+        // Mi Market 4.128+ can use the Miux4 controller, which is a different
+        // class and is deliberately not hooked through the legacy tab type.
+        runCatching {
+            val miux4Class = XposedHelpers.findClass(
+                "com.xiaomi.market.widget.BottomTabLayoutMiux4",
+                lpparam.classLoader,
+            )
+            XposedBridge.hookAllMethods(miux4Class, "commitNavigationItems", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val bottomTab = param.thisObject as? ViewGroup ?: return
+                    miMarketContext = bottomTab.context
+                    val activity = bottomTab.context as? Activity ?: return
+                    navigationStates[activity]?.get()?.bindBottomTab(bottomTab)
+                    // show() calls this even when no items need committing.
+                    // Settings synchronization belongs to setup/resume, not every native tab click.
+                }
+            })
+            XposedBridge.hookAllMethods(miux4Class, "show", object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val bottomTab = param.thisObject as? ViewGroup ?: return
+                    val activity = bottomTab.context as? Activity ?: return
+                    navigationStates[activity]?.get()?.bindBottomTab(bottomTab)
+                }
+            })
         }
     }
 
@@ -226,7 +361,7 @@ internal object MiMarketAdapter : TargetAdapter {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val key = param.args.firstOrNull() as? String ?: return
                     if (key !in miMarketManagedPreferenceKeys) return
-                    readMiMarketTabEnabledFromModule(key)?.let { param.result = it }
+                    miMarketTabPreferences[key]?.let { param.result = it }
                 }
             })
             XposedBridge.hookAllMethods(prefUtilsClass, "setBoolean", object : XC_MethodHook() {
@@ -235,6 +370,7 @@ internal object MiMarketAdapter : TargetAdapter {
                     val key = param.args.firstOrNull() as? String ?: return
                     if (key !in miMarketManagedPreferenceKeys) return
                     val enabled = param.args.getOrNull(1) as? Boolean ?: return
+                    miMarketTabPreferences[key] = enabled
                     writeMiMarketTabEnabledToModule(key, enabled)
                 }
             })
@@ -257,6 +393,7 @@ internal object MiMarketAdapter : TargetAdapter {
             val emptyPrefFiles = java.lang.reflect.Array.newInstance(prefFileClass, 0)
             miMarketManagedPreferenceKeys.forEach { key ->
                 val enabled = readMiMarketTabEnabledFromModule(context, key) ?: return@forEach
+                miMarketTabPreferences[key] = enabled
                 runCatching {
                     prefUtilsClass.methods.firstOrNull { method ->
                         method.name == "setBoolean" && method.parameterTypes.size == 3
@@ -309,5 +446,11 @@ internal object MiMarketAdapter : TargetAdapter {
         }
         return null
     }
+
+    private const val MIUX4_BOTTOM_TAB_CLASS = "com.xiaomi.market.widget.BottomTabLayoutMiux4"
+    private val MI_MARKET_BOTTOM_TAB_CLASSES = setOf(
+        "com.xiaomi.market.widget.BottomTabLayout",
+        MIUX4_BOTTOM_TAB_CLASS,
+    )
 
 }

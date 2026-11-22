@@ -1,9 +1,9 @@
 package io.github.offlineglass.hook.adapters.zhihu
 
 import android.view.View
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.hook.GlassHostLayout
 import java.util.WeakHashMap
 

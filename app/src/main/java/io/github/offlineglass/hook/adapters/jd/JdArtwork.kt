@@ -9,634 +9,270 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.drawable.Drawable
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
-import android.widget.TextView
-import android.os.SystemClock
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
+import io.github.offlineglass.hook.adapters.NavigationLabelLocalization
+import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
-/** Per-host native slot artwork, labels and unread badges. */
+/** Native icon pixels, semantic captions and native badges have separate lifetimes. */
 internal class JdArtwork {
-    data class CaptureLabels(val labels: List<TextView>, val retryLater: Boolean)
-
-    fun inspectCaptureLabels(source: ViewGroup, hasSnapshot: Boolean): CaptureLabels {
-        val labels = bottomLabelTextViews(source)
-        return CaptureLabels(labels, !hasSnapshot && labels.size >= 2 && labels.any { it.text.isNullOrBlank() })
+    private data class Caption(val text: String, val bounds: Rect)
+    private data class Item(val icon: Bitmap, val slotWidth: Int, val labelPaint: Paint,
+                            val label: Caption, val englishLabel: Caption)
+    private data class Frame(val rowType: Class<*>, val width: Int, val height: Int,
+                             val items: List<Item?>)
+    private data class Badge(val bitmap: Bitmap, val bounds: RectF, val slotWidth: Int, val rowHeight: Int)
+    private class Drawing {
+        val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val bounds = RectF()
     }
 
-    fun labelsHiddenDuringHomeCapture(labels: List<TextView>, selectedIndex: Int): List<Pair<TextView, Int>> =
-        if (selectedIndex != 0) emptyList() else labels
-            .filter { it.text?.toString()?.trim() == JD_HOME_TAB_LABEL }
-            .map { it to it.visibility }
-    fun bottomLabelTextViews(source: ViewGroup): List<TextView> {
-        val sourceLocation = IntArray(2).also(source::getLocationInWindow)
-        val sourceCenterY = sourceLocation[1] + source.height / 2f
-        val maxLabelHeight = (source.height * 0.35f).toInt().coerceAtLeast(1)
-        val maxLabelWidth = (source.width * 0.45f).toInt().coerceAtLeast(1)
-        val labels = mutableListOf<TextView>()
-        val stack = ArrayDeque<Pair<View, Int>>()
-        stack += source to 0
-        while (stack.isNotEmpty()) {
-            val (view, depth) = stack.removeLast()
-            if (view is TextView && view.width in 1..maxLabelWidth && view.height in 1..maxLabelHeight) {
-                val location = IntArray(2).also(view::getLocationInWindow)
-                if (location[1] + view.height / 2f > sourceCenterY) labels += view
-            }
-            if (view is ViewGroup && depth < 16) {
-                for (index in 0 until view.childCount) stack += view.getChildAt(index) to depth + 1
-            }
-        }
-        return labels
-    }
-    private data class JdBadgeOverlay(val bitmap: Bitmap, val slotRect: RectF)
-    private var navigationSource: ViewGroup? = null
-    private var slotCount = 5
-    private val jdStaticIcons = arrayOfNulls<Bitmap>(5)
-    private val jdBadgeOverlays = Array(5) { mutableListOf<JdBadgeOverlay>() }
-    private var jdLastBadgeCaptureAt = 0L
-    private var jdHomeDefaultIcon: Bitmap? = null
-    private var jdHomeDefaultIconRect: Rect? = null
-    private var jdNativeFrameWidth = 0
-    private var jdNativeFrameHeight = 0
-    private val navigationPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-    private val jdIconPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    // Both the View and optical Surface can draw the published artwork. An
+    // older frame keeps its bitmaps alive while the new frame is published.
+    @Volatile private var frame: Frame? = null
+    @Volatile private var badges: List<Badge?> = emptyList()
+    private val drawing = ThreadLocal.withInitial(::Drawing)
+    private var binding: JdNavigationBinding.Row? = null
+    private var lastBadgeCaptureAt = 0L
     private val selectedIconFilter = BlendModeColorFilter(0xFFE02E24.toInt(), BlendMode.SRC_IN)
     private val lightIconFilter = BlendModeColorFilter(0xFF424242.toInt(), BlendMode.SRC_IN)
     private val darkIconFilter = BlendModeColorFilter(Color.WHITE, BlendMode.SRC_IN)
-    var jdStaticIconsPopulated = false
+    val jdStaticIconsPopulated: Boolean get() = frame != null
+    var artworkRefreshPending = false
         private set
 
     fun prepare(source: ViewGroup?, count: Int) {
-        if (jdStaticIconsPopulated && (source !== navigationSource || count != slotCount ||
-                source?.width != jdNativeFrameWidth || source.height != jdNativeFrameHeight)) {
-            jdStaticIconsPopulated = false
-            jdHomeDefaultIcon = null
-            jdHomeDefaultIconRect = null
+        val row = JdNavigationBinding.resolve(source)?.takeIf { it.slots.size == count }
+        val previous = frame
+        if (row != null && previous != null &&
+            (previous.rowType != row.view.javaClass || previous.width != row.view.width || previous.height != row.view.height)) {
+            artworkRefreshPending = true
         }
-        navigationSource = source
-        slotCount = count
+        binding = row
     }
 
     fun accept(candidate: Bitmap, populate: Boolean): Boolean {
-        if (!jdStaticIconsPopulated && (!populate || !populateJdStaticIcons(candidate))) return false
-        captureJdBadgeOverlays(candidate)
+        if ((frame == null || artworkRefreshPending) && populate) {
+            captureFrame(candidate)?.let {
+                frame = it
+                artworkRefreshPending = false
+                lastBadgeCaptureAt = 0L
+            }
+        }
+        if (frame == null) return false
+        refreshBadges(candidate)
         return true
     }
-    fun refreshBadges(candidate: Bitmap) = captureJdBadgeOverlays(candidate)
-    private fun captureJdBadgeOverlays(candidate: Bitmap) {
 
-        val source = navigationSource ?: return
-
-        if (source.width <= 0 || source.height <= 0 || candidate.width <= 0 || candidate.height <= 0) return
-
-        val now = android.os.SystemClock.uptimeMillis()
-
-        if (now - jdLastBadgeCaptureAt < JD_BADGE_CAPTURE_INTERVAL_MS) return
-
-        jdLastBadgeCaptureAt = now
-
-        clearJdBadgeOverlays()
-
-        val sourceLocation = IntArray(2).also(source::getLocationInWindow)
-
-        val scaleX = candidate.width.toFloat() / source.width.toFloat()
-
-        val scaleY = candidate.height.toFloat() / source.height.toFloat()
-
-        val stack = ArrayDeque<View>()
-
-        stack += source
-
-        while (stack.isNotEmpty()) {
-
-            val view = stack.removeLast()
-
-            if (view.javaClass.name == JD_RED_POINT_VIEW_CLASS && view.isShown &&
-
-                view.width > 0 && view.height > 0 && view.alpha > 0f
-
-            ) {
-
-                val location = IntArray(2).also(view::getLocationInWindow)
-
-                val left = (location[0] - sourceLocation[0]) * scaleX
-
-                val top = (location[1] - sourceLocation[1]) * scaleY
-
-                val right = left + view.width * scaleX
-
-                val bottom = top + view.height * scaleY
-
-                val centerX = (left + right) * 0.5f
-
-                val index = (centerX / candidate.width * slotCount).toInt().coerceIn(0, slotCount - 1)
-
-                if (index in JD_BADGE_TAB_INDICES && index < jdBadgeOverlays.size) {
-
-                    val overlay = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
-
-                    Canvas(overlay).also(view::draw)
-
-                    val slotLeft = candidate.width * index.toFloat() / slotCount
-
-                    jdBadgeOverlays[index] += JdBadgeOverlay(
-
-                        overlay,
-
-                        RectF(left - slotLeft, top, right - slotLeft, bottom),
-
-                    )
-
-                }
-
-            }
-
-            if (view is ViewGroup) {
-
-                for (index in 0 until view.childCount) stack += view.getChildAt(index)
-
-            }
-
-        }
-
+    private fun slotWidth(candidate: Bitmap, source: ViewGroup, button: View): Int {
+        val scale = candidate.width.toFloat() / source.width.coerceAtLeast(1)
+        return ((button.right * scale).toInt() - (button.left * scale).toInt()).coerceAtLeast(0)
     }
 
-
-
-    private fun clearJdBadgeOverlays() {
-
-        jdBadgeOverlays.forEach { overlays ->
-
-            overlays.forEach { it.bitmap.takeUnless(Bitmap::isRecycled)?.recycle() }
-
-            overlays.clear()
-
+    private fun captureFrame(candidate: Bitmap): Frame? {
+        val row = binding ?: return null
+        val source = row.view
+        if (source.width <= 0 || source.height <= 0 || !row.isCurrent()) return null
+        val items = arrayOfNulls<Item>(row.slots.size)
+        val icons = arrayOfNulls<Bitmap>(row.slots.size)
+        var published = false
+        try {
+            // Draw only the native icon View. Text and unread badges are its
+            // siblings, so a transient hidden TextView cannot affect this cache.
+            for (index in row.slots.indices) {
+                if (index == JdNavigationBinding.HOME || index == JdNavigationBinding.BROWSE) continue
+                val icon = row.slots[index].icon
+                icons[index] = raster(icon.width, icon.height, icon::draw) ?: return null
+            }
+            icons[JdNavigationBinding.HOME] = captureHome(row, icons.filterNotNull()) ?: return null
+            for (index in row.slots.indices) {
+                val icon = icons[index] ?: continue
+                val slot = row.slots[index]
+                val width = slotWidth(candidate, source, slot.button)
+                if (width <= 0) return null
+                val title = slot.title?.trim()?.takeIf(String::isNotEmpty) ?: targetSpec.entryLabels[index]
+                val paint = Paint(slot.label.paint).apply {
+                    isAntiAlias = true
+                    textAlign = Paint.Align.CENTER
+                    textScaleX = 1f
+                    style = Paint.Style.FILL
+                }
+                if (paint.textSize <= 0f) return null
+                fun caption(text: String) = Caption(text, Rect().also { paint.getTextBounds(text, 0, text.length, it) })
+                items[index] = Item(icon, width, paint, caption(title),
+                    caption(NavigationLabelLocalization.toEnglish("jd", title)))
+            }
+            return Frame(source.javaClass, source.width, candidate.height, items.toList()).also { published = true }
+        } finally {
+            if (!published) icons.forEach { it?.recycle() }
         }
-
     }
 
-
-
-    /** Extract every tab's icon slot from the settled native frame into the
-
-     *  static icon cache. The bitmap is drawn at its native aspect ratio,
-
-     *  scaled by the slot transform factor to match the visual slot size. */
-
-
-    private fun populateJdStaticIcons(candidate: Bitmap): Boolean {
-
-        if (candidate.width <= 0 || candidate.height <= 0 || slotCount <= 0) return false
-
-        captureJdDefaultHomeIcon()
-        // Do not permanently freeze an async/partially laid-out Home slot.
-        val homeSlot = buildJdDefaultHomeSlot(candidate) ?: return false
-
-        jdNativeFrameWidth = candidate.width
-
-        jdNativeFrameHeight = candidate.height
-
-        val count = minOf(slotCount, jdStaticIcons.size)
-
-        for (index in 0 until count) {
-
-            val slotLeft = candidate.width * index / slotCount
-
-            val slotRight = candidate.width * (index + 1) / slotCount
-
-            val slotWidth = slotRight - slotLeft
-
-            if (slotWidth <= 0) continue
-
-            jdStaticIcons[index]?.takeUnless(Bitmap::isRecycled)?.recycle()
-
-            jdStaticIcons[index] = Bitmap.createBitmap(
-
-                candidate, slotLeft, 0, slotWidth, candidate.height
-
-            )
-
+    /** Keep the same native Home house asset used by the previous renderer. */
+    private fun captureHome(row: JdNavigationBinding.Row, peerIcons: List<Bitmap>): Bitmap? {
+        val view = row.slots[JdNavigationBinding.HOME].icon
+        val drawable = defaultDrawable(view) ?: return raster(view.width, view.height, view::draw)
+        val nativeBounds = row.slots.drop(1).filter { it.button.isShown }.mapNotNull { slot ->
+            val bounds = defaultDrawable(slot.icon)?.let { field(it, "lastIconRect") } as? Rect
+            bounds?.takeIf { it.width() in 1..slot.icon.width && it.height() in 1..slot.icon.height }
         }
-
-        // Rebuild Home as a complete native slot (icon + JD's own TextView),
-
-        // just like the other four cached items. Only its unstable Lottie
-
-        // artwork is replaced by the app's default house drawable.
-
-        homeSlot.let { homeSlot ->
-
-            jdStaticIcons[0]?.takeUnless(Bitmap::isRecycled)?.recycle()
-
-            jdStaticIcons[0] = homeSlot
-
+        fun median(values: List<Int>) = values.sorted()[values.size / 2]
+        val referenceWidth = median(if (nativeBounds.size >= 2) nativeBounds.map(Rect::width) else peerIcons.map(Bitmap::getWidth))
+        val referenceHeight = median(if (nativeBounds.size >= 2) nativeBounds.map(Rect::height) else peerIcons.map(Bitmap::getHeight))
+        val bitmap = (field(drawable, "bitmap") as? Bitmap)?.takeUnless(Bitmap::isRecycled)
+        val width = bitmap?.width ?: drawable.intrinsicWidth.takeIf { it > 0 } ?: referenceWidth
+        val height = bitmap?.height ?: drawable.intrinsicHeight.takeIf { it > 0 } ?: referenceHeight
+        val fit = min(referenceWidth.toFloat() / width, referenceHeight.toFloat() / height)
+        val fittedWidth = (width * fit).roundToInt().coerceAtLeast(1)
+        val fittedHeight = (height * fit).roundToInt().coerceAtLeast(1)
+        return raster(fittedWidth, fittedHeight) { canvas ->
+            if (bitmap != null) {
+                canvas.drawBitmap(bitmap, null, Rect(0, 0, fittedWidth, fittedHeight), Paint(Paint.FILTER_BITMAP_FLAG))
+            } else {
+                val previousBounds = Rect(drawable.bounds)
+                try {
+                    drawable.setBounds(0, 0, fittedWidth, fittedHeight)
+                    drawable.draw(canvas)
+                } finally {
+                    drawable.bounds = previousBounds
+                }
+            }
         }
-
-        jdStaticIconsPopulated = true
-        return true
-
     }
 
-
-
-    /**
-
-     * Extract the file manager's main tab row artwork (最近/浏览 tabs plus the
-
-     * standalone circular search key) into the static icon cache. Unlike the
-
-     * generic snapshot path, each element is drawn in isolation, so the pill
-
-     * geometry never distorts the artwork. The multi-select action bar does
-
-     * not use this cache (its source id is split_action_bar).
-
-     */
-
-
-    private fun buildJdDefaultHomeSlot(candidate: Bitmap): Bitmap? {
-
-        val source = navigationSource ?: return null
-
-        val house = jdHomeDefaultIcon?.takeUnless(Bitmap::isRecycled) ?: return null
-
-        if (slotCount <= 0 || source.width <= 0 || source.height <= 0) return null
-
-        val slotWidth = candidate.width / slotCount
-
-        if (slotWidth <= 0) return null
-
-        val sourceLocation = IntArray(2).also(source::getLocationInWindow)
-
-        val stack = ArrayDeque<View>()
-
-        stack += source
-
-        var iconView: View? = null
-        val iconViews = mutableListOf<View>()
-
-        var iconCenterX = Float.MAX_VALUE
-
-        while (stack.isNotEmpty()) {
-
-            val view = stack.removeLast()
-
-            if (view.javaClass.name == JD_NAVIGATION_ICON_VIEW_CLASS && view.width > 0 && view.height > 0) {
-                iconViews += view
-
-                val location = IntArray(2).also(view::getLocationInWindow)
-
-                val centerX = location[0] - sourceLocation[0] + view.width * 0.5f
-
-                if (centerX < iconCenterX) {
-
-                    iconCenterX = centerX
-
-                    iconView = view
-
-                }
-
+    private fun raster(width: Int, height: Int, draw: (Canvas) -> Unit): Bitmap? {
+        if (width <= 0 || height <= 0 || width.toLong() * height > 1_000_000) return null
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        var keep = false
+        try {
+            draw(Canvas(bitmap))
+            val pixels = IntArray(width * height)
+            bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+            var left = width
+            var top = height
+            var right = 0
+            var bottom = 0
+            for (y in 0 until height) for (x in 0 until width) {
+                if (pixels[y * width + x] ushr 24 == 0) continue
+                left = min(left, x)
+                top = min(top, y)
+                right = max(right, x + 1)
+                bottom = max(bottom, y + 1)
             }
-
-            if (view is ViewGroup) {
-
-                for (index in 0 until view.childCount) stack += view.getChildAt(index)
-
-            }
-
+            if (right <= left || bottom <= top) return null
+            return Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top).also { keep = it === bitmap }
+        } finally {
+            if (!keep) bitmap.recycle()
         }
-
-        val homeIconView = iconView ?: return null
-
-        var ancestor: Any? = homeIconView.parent
-
-        var homeButton: View? = null
-
-        while (ancestor is View) {
-
-            if (ancestor.javaClass.name == JD_NAVIGATION_BUTTON_CLASS) {
-
-                homeButton = ancestor
-
-                break
-
-            }
-
-            ancestor = ancestor.parent
-
-        }
-
-        val label = (homeButton?.let { readPrivateField(it, "naviText") } as? TextView)
-
-            ?: (readPrivateField(homeIconView, "mNaviText") as? TextView)
-
-            ?: return null
-
-        val scaleX = candidate.width.toFloat() / source.width.toFloat()
-
-        val scaleY = candidate.height.toFloat() / source.height.toFloat()
-
-        // The selected Home view/lastIconRect belongs to JD's Lottie morph.
-        // Use settled peer bounds and fit the house uniformly, never stretch
-        // it to that transient rectangle or reuse the label's animated X.
-        val peers = iconViews.filter { it !== homeIconView }.mapNotNull { peer ->
-            val drawable = (readPrivateField(peer, "defaultDrawable") as? Drawable)
-                ?: (readPrivateField(peer, "defaultNormalDrawable") as? Drawable)
-            val bounds = (drawable?.let { readPrivateField(it, "lastIconRect") } as? Rect)
-                ?.takeIf { it.width() > 0 && it.height() > 0 &&
-                    it.left >= 0 && it.top >= 0 && it.right <= peer.width && it.bottom <= peer.height }
-                ?: return@mapNotNull null
-            val location = IntArray(2).also(peer::getLocationInWindow)
-            RectF(0f, (location[1] - sourceLocation[1] + bounds.top).toFloat(),
-                bounds.width().toFloat(), (location[1] - sourceLocation[1] + bounds.bottom).toFloat())
-        }
-        if (peers.size < 2 || label.paint.textSize <= 0f) return null
-        fun median(values: List<Float>) = values.sorted()[values.size / 2]
-        val iconWidth = median(peers.map { it.width() }) * scaleX
-        val iconHeight = median(peers.map { it.height() }) * scaleY
-        val iconCenterY = median(peers.map { it.centerY() }) * scaleY
-        val fit = min(iconWidth / house.width, iconHeight / house.height)
-        val houseWidth = house.width * fit
-        val houseHeight = house.height * fit
-
-        val slot = Bitmap.createBitmap(slotWidth, candidate.height, Bitmap.Config.ARGB_8888)
-
-        val slotCanvas = Canvas(slot)
-
-        val houseRect = RectF((slotWidth - houseWidth) / 2f, iconCenterY - houseHeight / 2f,
-            (slotWidth + houseWidth) / 2f, iconCenterY + houseHeight / 2f)
-
-        slotCanvas.drawBitmap(house, null, houseRect, navigationPaint)
-
-
-
-        val labelLocation = IntArray(2).also(label::getLocationInWindow)
-
-        // JD suppresses the Home TextView's own draw pass while Home is
-
-        // selected. Reuse its exact native paint metrics and baseline, but
-
-        // draw the fixed label directly so the cached slot can never lose it.
-
-        val labelPaint = Paint(label.paint).apply {
-
-            color = Color.WHITE
-
-            alpha = 255
-
-            textAlign = Paint.Align.CENTER
-
-            style = Paint.Style.FILL
-            textScaleX = 1f
-
-        }
-
-        val labelCenterX = source.width.toFloat() / slotCount / 2f
-
-        // Home's selected-state TextView is temporarily shifted upward by JD.
-
-        // Use the median baseline of the other native tab labels so all five
-
-        // captions share one visual line without hard-coding a pixel offset.
-
-        val peerBaselines = mutableListOf<Float>()
-
-        val labelStack = ArrayDeque<View>()
-
-        labelStack += source
-
-        while (labelStack.isNotEmpty()) {
-
-            val view = labelStack.removeLast()
-
-            if (view.javaClass.name == JD_NAVIGATION_BUTTON_CLASS) {
-
-                val peer = readPrivateField(view, "naviText") as? TextView
-
-                if (peer != null && peer !== label && peer.width > 0 && peer.height > 0) {
-
-                    val peerLocation = IntArray(2).also(peer::getLocationInWindow)
-
-                    peerBaselines += peerLocation[1] - sourceLocation[1] + peer.baseline.toFloat()
-
-                }
-
-            }
-
-            if (view is ViewGroup) {
-
-                for (index in 0 until view.childCount) labelStack += view.getChildAt(index)
-
-            }
-
-        }
-
-        peerBaselines.sort()
-
-        val labelBaseline = peerBaselines.getOrNull(peerBaselines.size / 2)
-
-            ?: (labelLocation[1] - sourceLocation[1] + label.baseline.toFloat())
-
-        slotCanvas.save()
-
-        slotCanvas.scale(scaleX, scaleY)
-
-        slotCanvas.drawText(JD_HOME_TAB_LABEL, labelCenterX, labelBaseline, labelPaint)
-
-        slotCanvas.restore()
-
-        return slot
-
     }
 
-
-
-    /**
-
-     * Read JD's own non-animated Home drawable from the left-most
-
-     * NavigationIconView. This avoids both hand-drawn artwork and the selected
-
-     * Joy/Lottie frame while keeping the asset matched to the installed JD
-
-     * version and current skin.
-
-     */
-
-
-    private fun captureJdDefaultHomeIcon() {
-
-        if (jdHomeDefaultIcon?.let { !it.isRecycled } == true) return
-
-        val source = navigationSource ?: return
-
-        val stack = ArrayDeque<View>()
-
-        stack += source
-
-        var homeIconView: View? = null
-
-        var homeCenterX = Float.MAX_VALUE
-
-        val sourceLocation = IntArray(2).also(source::getLocationInWindow)
-
-        while (stack.isNotEmpty()) {
-
-            val view = stack.removeLast()
-
-            if (view.javaClass.name == JD_NAVIGATION_ICON_VIEW_CLASS &&
-
-                view.isAttachedToWindow && view.width > 0 && view.height > 0
-
-            ) {
-
-                val location = IntArray(2).also(view::getLocationInWindow)
-
-                val centerX = location[0] - sourceLocation[0] + view.width * 0.5f
-
-                if (centerX < homeCenterX) {
-
-                    homeCenterX = centerX
-
-                    homeIconView = view
-
-                }
-
-            }
-
-            if (view is ViewGroup) {
-
-                for (index in 0 until view.childCount) stack += view.getChildAt(index)
-
-            }
-
+    fun refreshBadges(candidate: Bitmap) {
+        val row = binding ?: return
+        val source = row.view
+        if (source.width <= 0 || source.height <= 0) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastBadgeCaptureAt < BADGE_CAPTURE_INTERVAL_MS) return
+        lastBadgeCaptureAt = now
+        val scaleX = candidate.width.toFloat() / source.width
+        val scaleY = candidate.height.toFloat() / source.height
+        val origin = IntArray(2).also(source::getLocationInWindow)
+        badges = row.slots.mapIndexed { index, slot ->
+            val badge = slot.badge
+            if (index < 2 || !badge.isShown || badge.width <= 0 || badge.height <= 0 || badge.alpha <= 0f) return@mapIndexed null
+            val width = slotWidth(candidate, source, slot.button)
+            if (width <= 0) return@mapIndexed null
+            val position = IntArray(2).also(badge::getLocationInWindow)
+            val left = (position[0] - origin[0]) * scaleX - (slot.button.left * scaleX).toInt()
+            val top = (position[1] - origin[1]) * scaleY
+            val bitmap = Bitmap.createBitmap(badge.width, badge.height, Bitmap.Config.ARGB_8888)
+            badge.draw(Canvas(bitmap))
+            Badge(bitmap, RectF(left, top, left + badge.width * scaleX, top + badge.height * scaleY), width, candidate.height)
         }
-
-        val iconView = homeIconView ?: return
-
-        val drawable = (readPrivateField(iconView, "defaultDrawable") as? Drawable)
-
-            ?: (readPrivateField(iconView, "defaultNormalDrawable") as? Drawable)
-
-            ?: return
-
-        jdHomeDefaultIconRect = (readPrivateField(drawable, "lastIconRect") as? Rect)?.let(::Rect)
-
-        val sourceBitmap = readPrivateField(drawable, "bitmap") as? Bitmap
-
-        val copied = sourceBitmap?.takeUnless(Bitmap::isRecycled)?.copy(Bitmap.Config.ARGB_8888, false)
-
-            ?: run {
-
-                val iconWidth = drawable.intrinsicWidth.takeIf { it > 0 } ?: iconView.width
-
-                val iconHeight = drawable.intrinsicHeight.takeIf { it > 0 } ?: iconView.height
-
-                if (iconWidth <= 0 || iconHeight <= 0) return
-
-                Bitmap.createBitmap(iconWidth, iconHeight, Bitmap.Config.ARGB_8888).also { target ->
-
-                    val oldBounds = Rect(drawable.bounds)
-
-                    drawable.setBounds(0, 0, target.width, target.height)
-
-                    drawable.draw(Canvas(target))
-
-                    drawable.setBounds(oldBounds)
-
-                }
-
-            }
-
-        jdHomeDefaultIcon?.takeUnless(Bitmap::isRecycled)?.recycle()
-
-        jdHomeDefaultIcon = copied
-
     }
 
-
-
-    /** Commit the candidate bitmap as the navigation snapshot. */
-
-    fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
-        if (!jdStaticIconsPopulated || frame.slotCount <= 0 || frame.width <= 0 || frame.height <= 0) return
-        if (jdNativeFrameWidth <= 0 || jdNativeFrameHeight <= 0) return
-        val itemScale = frame.iconScale * frame.extraScale * JD_STATIC_CONTENT_SCALE
-        val contentCenterY = frame.height / 2f + JD_STATIC_CONTENT_OFFSET_Y_DP * frame.density
-        for ((visualIndex, index) in frame.enabledIndices.withIndex()) {
-            val bitmap = jdStaticIcons.getOrNull(index)?.takeUnless(Bitmap::isRecycled) ?: continue
-            val centerX = 4f * frame.density + (visualIndex + 0.5f) * frame.slotWidth
-            val selected = index == frame.selectedIndex
-            canvas.save()
-            canvas.scale(itemScale, itemScale, centerX, contentCenterY)
-            jdIconPaint.colorFilter = if (selected) selectedIconFilter
-                else if (frame.darkGlass) darkIconFilter else lightIconFilter
-            jdIconPaint.alpha = if (selected) 255 else 235
-            val bmpW = bitmap.width.toFloat().coerceAtLeast(1f)
-            val bmpH = bitmap.height.toFloat().coerceAtLeast(1f)
-            val drawScale = min(frame.slotWidth / bmpW, frame.height / bmpH)
-            val drawWidth = bmpW * drawScale
-            val drawHeight = bmpH * drawScale
-            val iconRect = RectF(centerX - drawWidth / 2f, contentCenterY - drawHeight / 2f,
-                centerX + drawWidth / 2f, contentCenterY + drawHeight / 2f)
-            canvas.drawBitmap(bitmap, null, iconRect, jdIconPaint)
-            jdIconPaint.colorFilter = null
-            jdIconPaint.alpha = 255
-            jdBadgeOverlays.getOrNull(index).orEmpty().forEach { overlay ->
-                val destination = RectF(
-                    iconRect.left + overlay.slotRect.left * drawScale,
-                    iconRect.top + overlay.slotRect.top * drawScale,
-                    iconRect.left + overlay.slotRect.right * drawScale,
-                    iconRect.top + overlay.slotRect.bottom * drawScale,
-                )
-                canvas.drawBitmap(overlay.bitmap, null, destination, jdIconPaint)
+    fun draw(canvas: Canvas, bar: AdapterNavigationFrame) {
+        val current = frame ?: return
+        if (bar.width <= 0 || bar.height <= 0 || bar.slotWidth <= 0f) return
+        val badgeFrame = badges
+        val resources = drawing.get()
+        val itemScale = bar.iconScale * bar.extraScale * CONTENT_SCALE
+        val centerY = bar.height / 2f
+        val badgeCenterY = centerY + BADGE_OFFSET_Y_DP * bar.density
+        for ((visualIndex, index) in bar.enabledIndices.withIndex()) {
+            val item = current.items.getOrNull(index) ?: continue
+            val centerX = 4f * bar.density + (visualIndex + 0.5f) * bar.slotWidth
+            val selected = index == bar.selectedIndex
+            val color = if (selected) 0xFFE02E24.toInt() else if (bar.darkGlass) Color.WHITE else 0xFF424242.toInt()
+            val baseScale = min(bar.slotWidth / item.slotWidth, bar.height.toFloat() / current.height) * itemScale
+            val label = if (bar.managerEnglishLabels) item.englishLabel else item.label
+            val iconScale = baseScale * ICON_ENLARGEMENT
+            val textScale = baseScale * CAPTION_SCALE
+            val gap = if (bar.iconOnly) 0f else CAPTION_GAP_DP * bar.density
+            val labelHeight = if (bar.iconOnly) 0f else label.bounds.height() * textScale
+            val groupHeight = item.icon.height * iconScale + gap + labelHeight
+            val groupWidth = max(item.icon.width * iconScale, if (bar.iconOnly) 0f else label.bounds.width() * textScale)
+            val fit = min(1f, min(bar.height / groupHeight, bar.slotWidth / groupWidth))
+            val iconWidth = item.icon.width * iconScale * fit
+            val iconHeight = item.icon.height * iconScale * fit
+            val top = centerY - groupHeight * fit / 2f
+            resources.bounds.set(centerX - iconWidth / 2f, top, centerX + iconWidth / 2f, top + iconHeight)
+            resources.iconPaint.colorFilter = if (selected) selectedIconFilter else if (bar.darkGlass) darkIconFilter else lightIconFilter
+            resources.iconPaint.alpha = if (selected) 255 else 235
+            canvas.drawBitmap(item.icon, null, resources.bounds, resources.iconPaint)
+            if (!bar.iconOnly) {
+                resources.labelPaint.set(item.labelPaint)
+                resources.labelPaint.color = color
+                resources.labelPaint.alpha = if (selected) 255 else 235
+                resources.labelPaint.textSize = item.labelPaint.textSize * textScale * fit
+                val baseline = top + iconHeight + (gap - label.bounds.top * textScale) * fit
+                canvas.drawText(label.text, centerX, baseline, resources.labelPaint)
             }
-            canvas.restore()
+            badgeFrame.getOrNull(index)?.let { badge ->
+                val scale = min(bar.slotWidth / badge.slotWidth, bar.height.toFloat() / badge.rowHeight) * itemScale
+                val left = centerX - badge.slotWidth * scale / 2f
+                val originY = badgeCenterY - badge.rowHeight * scale / 2f
+                resources.bounds.set(left + badge.bounds.left * scale, originY + badge.bounds.top * scale,
+                    left + badge.bounds.right * scale, originY + badge.bounds.bottom * scale)
+                resources.iconPaint.colorFilter = null
+                resources.iconPaint.alpha = 255
+                canvas.drawBitmap(badge.bitmap, null, resources.bounds, resources.iconPaint)
+            }
         }
-        jdIconPaint.colorFilter = null
-        jdIconPaint.alpha = 255
     }
 
     fun dispose() {
-        jdStaticIcons.forEach { it?.takeUnless(Bitmap::isRecycled)?.recycle() }
-        jdStaticIcons.fill(null)
-        clearJdBadgeOverlays()
-        jdHomeDefaultIcon?.takeUnless(Bitmap::isRecycled)?.recycle()
-        jdHomeDefaultIcon = null
-        jdHomeDefaultIconRect = null
-        jdStaticIconsPopulated = false
-        jdNativeFrameWidth = 0
-        jdNativeFrameHeight = 0
-        jdLastBadgeCaptureAt = 0L
-        navigationSource = null
+        frame = null
+        badges = emptyList()
+        binding = null
+        artworkRefreshPending = false
+        lastBadgeCaptureAt = 0L
+        drawing.remove()
     }
 
-    private fun readPrivateField(instance: Any, name: String): Any? {
+    private fun defaultDrawable(view: View): Drawable? =
+        (field(view, "defaultDrawable") as? Drawable) ?: (field(view, "defaultNormalDrawable") as? Drawable)
+
+    private fun field(instance: Any, name: String): Any? {
         var type: Class<*>? = instance.javaClass
         while (type != null) {
             val field = runCatching { type.getDeclaredField(name) }.getOrNull()
-            if (field != null) return runCatching {
-                field.isAccessible = true
-                field.get(instance)
-            }.getOrNull()
+            if (field != null) return runCatching { field.isAccessible = true; field.get(instance) }.getOrNull()
             type = type.superclass
         }
         return null
     }
 
     private companion object {
-        const val JD_BADGE_CAPTURE_INTERVAL_MS = 250L
-        val JD_BADGE_TAB_INDICES = setOf(2, 3, 4)
-        const val JD_RED_POINT_VIEW_CLASS =
-            "com.jingdong.common.unification.navigationbar.newbar.RedPointView"
-        const val JD_NAVIGATION_ICON_VIEW_CLASS =
-            "com.jingdong.common.unification.navigationbar.newbar.NavigationIconView"
-        const val JD_NAVIGATION_BUTTON_CLASS =
-            "com.jingdong.common.unification.navigationbar.newbar.NavigationButton"
-        const val JD_HOME_TAB_LABEL = "首页"
-        const val JD_STATIC_CONTENT_SCALE = 1.16f
-        const val JD_STATIC_CONTENT_OFFSET_Y_DP = -4f
+        const val ICON_ENLARGEMENT = 1.2f
+        const val CAPTION_SCALE = 0.9f
+        const val CAPTION_GAP_DP = 2f
+        const val CONTENT_SCALE = 1.16f
+        const val BADGE_OFFSET_Y_DP = -4f
+        const val BADGE_CAPTURE_INTERVAL_MS = 250L
     }
 }
-

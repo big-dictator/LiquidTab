@@ -41,15 +41,21 @@ data class ManagerSettings(
     val lastActivePackage: String?,
     val lastActiveTime: Long,
     val appEntryLabels: Map<String, List<String>> = emptyMap(),
-)
+    val language: ManagerLanguage = ManagerLanguage.CHINESE,
+    val douyinTopChannels: List<DouyinTopChannel> = emptyList(),
+    val tiktokTopChannels: List<io.github.offlineglass.config.TikTokTopChannel> = emptyList(),
+) {
+    /** Manager controls follow the liquid-glass switch, never a second saved flag. */
+    val iosStyle: Boolean get() = liquidGlassEnabled
+    val frostedGlassEnabled: Boolean
+        get() = !solidBarEnabled && !liquidGlassEnabled && glass.blurRadius > 0f
+}
 
 object LocalSettings {
     private const val PREFS = "offline_glass"
     private const val GLOBAL = "glass_"
     private const val PREVIOUS_LIQUID_GLASS = "previous_liquid_glass_enabled"
     private const val PREVIOUS_BOTTOM_GRADIENT = "previous_bottom_gradient_blur_enabled"
-    private const val FORMAL_DEFAULTS_V1 = "formal_defaults_v1"
-    private const val GLOBAL_DEFAULTS_V2 = "global_defaults_v2"
     private const val MI_MARKET_TAB_PREFIX = "mi_market_tab_"
     private val MI_MARKET_TAB_KEYS = listOf("pref_key_short_play", "pref_key_mini_game")
 
@@ -74,17 +80,22 @@ object LocalSettings {
                 context
             }
         }
+        // Modern service exports an atomic mirror; never use deprecated world-readable files.
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        SharedPreferenceMigration.importLatest(ctx, prefs, PREFS)
         // Cold-start migration: copy existing settings from device-protected
         // storage (where earlier versions wrote) to the default credential-
         // protected storage that XSharedPreferences reads from, so the hook
         // code in target processes always sees the latest values.
-        if (!prefs.contains("_migrated_from_de")) {
+        if (!ctx.isDeviceProtectedStorage && !prefs.contains("_migrated_from_de")) {
             val de = context.createDeviceProtectedStorageContext()
                 .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             if (de.all.isNotEmpty()) {
                 prefs.edit().apply {
                     de.all.forEach { (k, v) ->
+                        // Existing CE values are the user's current settings,
+                        // not a destination to overwrite with an old DE copy.
+                        if (prefs.contains(k)) return@forEach
                         when (v) {
                             is String -> putString(k, v)
                             is Boolean -> putBoolean(k, v)
@@ -113,13 +124,17 @@ object LocalSettings {
         return prefs
     }
 
-    fun snapshot(context: Context): ManagerSettings {
+    internal fun exportPreferences(context: Context): SharedPreferences = prefs(context)
+
+    fun snapshot(context: Context, knownInstalledPackages: Set<String>? = null): ManagerSettings {
         val p = prefs(context)
         val liquidGlassEnabled = p.getBoolean(ConfigContract.KEY_LIQUID_GLASS_ENABLED, true)
         val bottomGradientBlurEnabled = false
         val solidBarEnabled = p.getBoolean(ConfigContract.KEY_SOLID_BAR_ENABLED, false)
         val outlineEnabled = p.getBoolean(ConfigContract.KEY_OUTLINE_ENABLED, true)
-        val global = readConfig(p, GLOBAL, GlassConfig()).normalized().copy(
+        val rawGlobal = readConfig(p, GLOBAL, GlassConfig())
+        val global = rawGlobal.normalized().copy(
+            classicNavigation = rawGlobal.classicNavigation,
             liquidGlassEnabled = liquidGlassEnabled,
             bottomGradientBlurEnabled = bottomGradientBlurEnabled,
             solidBarEnabled = solidBarEnabled,
@@ -128,7 +143,7 @@ object LocalSettings {
         val apps = AppCatalog.targets.associate { target ->
             target.packageName to p.getBoolean("app_${target.packageName}", true)
         }
-        val installedPackages = AppCatalog.targets.mapNotNullTo(linkedSetOf()) { target ->
+        val installedPackages = knownInstalledPackages ?: AppCatalog.targets.mapNotNullTo(linkedSetOf()) { target ->
             target.packageName.takeIf {
                 runCatching { context.packageManager.getApplicationInfo(it, 0) }.isSuccess
             }
@@ -153,13 +168,15 @@ object LocalSettings {
                 lightAlpha = global.lightAlpha,
                 darkAlpha = global.darkAlpha,
                 darkBarHighlightStrength = global.darkBarHighlightStrength,
+                highlightTransparency = global.highlightTransparency,
                 bottomGradientBlurEnabled = false,
-            )
+            ).normalized(target.packageName)
         }
         return ManagerSettings(
+            language = ManagerLanguage.fromValue(p.getString("manager_language", "zh")),
             uiMode = UiMode.fromValue(p.getString("ui_mode", UiMode.MIUIX.value)),
             colorMode = ColorMode.fromValue(p.getString("color_mode", ColorMode.SYSTEM.value)),
-            dynamicColor = p.getBoolean("dynamic_color", true),
+            dynamicColor = p.getBoolean("dynamic_color", false),
             liquidGlassEnabled = liquidGlassEnabled,
             bottomGradientBlurEnabled = bottomGradientBlurEnabled,
             solidBarEnabled = solidBarEnabled,
@@ -180,6 +197,8 @@ object LocalSettings {
                     List(array.length()) { array.getString(it) }
                 }.getOrDefault(emptyList())
             },
+            douyinTopChannels = DouyinTopChannels.decode(p.getString(ConfigContract.KEY_DOUYIN_TOP_TABS, "[]").orEmpty()),
+            tiktokTopChannels = io.github.offlineglass.config.TikTokTopChannels.decode(p.getString(ConfigContract.KEY_TIKTOK_TOP_CHANNELS, "[]").orEmpty()),
         )
     }
 
@@ -191,6 +210,7 @@ object LocalSettings {
         val solidBarEnabled = p.getBoolean(ConfigContract.KEY_SOLID_BAR_ENABLED, false)
         val outlineEnabled = p.getBoolean(ConfigContract.KEY_OUTLINE_ENABLED, true)
         val global = readConfig(p, GLOBAL, GlassConfig()).copy(
+            classicNavigation = readConfig(p, GLOBAL, GlassConfig()).classicNavigation,
             liquidGlassEnabled = liquidGlassEnabled,
             bottomGradientBlurEnabled = bottomGradientBlurEnabled,
             solidBarEnabled = solidBarEnabled,
@@ -211,46 +231,60 @@ object LocalSettings {
             lightAlpha = global.lightAlpha,
             darkAlpha = global.darkAlpha,
             darkBarHighlightStrength = global.darkBarHighlightStrength,
+            highlightTransparency = global.highlightTransparency,
             liquidGlassEnabled = liquidGlassEnabled,
             bottomGradientBlurEnabled = false,
             solidBarEnabled = solidBarEnabled,
             outlineEnabled = outlineEnabled,
-        ).normalized()
+        ).normalized(canonicalPackage)
     }
 
     fun setUiMode(context: Context, value: UiMode) = edit(context) { putString("ui_mode", value.value) }
+    @Synchronized
+    fun setLanguage(context: Context, value: ManagerLanguage) {
+        // Publish the selected module language as part of the normal versioned
+        // config so adapter-painted labels update in already-running targets.
+        edit(context) {
+            putString("manager_language", value.value)
+            putBoolean(GLOBAL + ConfigContract.KEY_MANAGER_ENGLISH_LABELS, value == ManagerLanguage.ENGLISH)
+        }
+    }
     fun setColorMode(context: Context, value: ColorMode) = edit(context) { putString("color_mode", value.value) }
     fun setDynamicColor(context: Context, value: Boolean) = edit(context) { putBoolean("dynamic_color", value) }
     fun setLiquidGlassEnabled(context: Context, value: Boolean) =
-        edit(context) { putBoolean(ConfigContract.KEY_LIQUID_GLASS_ENABLED, value) }
+        edit(context) {
+            if (value) putBoolean(ConfigContract.KEY_SOLID_BAR_ENABLED, false)
+            putBoolean(ConfigContract.KEY_LIQUID_GLASS_ENABLED, value)
+        }
 
-    /** Applies the public 1.0 defaults once, including when upgrading from a debug build. */
+    fun setFrostedGlassEnabled(context: Context, value: Boolean) {
+        val p = prefs(context)
+        edit(context) {
+            putBoolean(ConfigContract.KEY_SOLID_BAR_ENABLED, false)
+            putBoolean(ConfigContract.KEY_LIQUID_GLASS_ENABLED, !value)
+            if (value && p.getFloat(GLOBAL + ConfigContract.KEY_BLUR_RADIUS, GlassConfig().blurRadius) == 0f) {
+                putFloat(GLOBAL + ConfigContract.KEY_BLUR_RADIUS, 4f)
+            }
+        }
+    }
+
+    /** Publishes initial settings without overwriting stored preferences on upgrade. */
     fun applyFormalDefaultsOnce(context: Context) {
         val p = prefs(context)
         val edit = p.edit()
         var changed = false
-        if (!p.getBoolean(FORMAL_DEFAULTS_V1, false)) {
-            edit.putBoolean(FORMAL_DEFAULTS_V1, true)
-                .putBoolean(ConfigContract.KEY_LIQUID_GLASS_ENABLED, false)
-                .putBoolean(ConfigContract.KEY_SOLID_BAR_ENABLED, false)
-                .putBoolean(ConfigContract.KEY_OUTLINE_ENABLED, true)
+        if (!p.getBoolean("douyin_apk_top_defaults_20261024", false)) {
+            edit.putBoolean("douyin_apk_top_defaults_20261024", true)
+            val pins = appPrefix("com.ss.android.ugc.aweme") + ConfigContract.KEY_DOUYIN_PINNED_TABS
+            if (!p.contains(pins)) edit.putString(pins, DouyinTopChannels.DEFAULT_PINS)
             changed = true
         }
-        if (!p.getBoolean(GLOBAL_DEFAULTS_V2, false)) {
-            edit.putBoolean(GLOBAL_DEFAULTS_V2, true)
-                .putBoolean(ConfigContract.KEY_BOTTOM_GRADIENT_BLUR_ENABLED, false)
-                .putFloat(GLOBAL + ConfigContract.KEY_BLUR_RADIUS, 2f)
-                .putFloat(GLOBAL + ConfigContract.KEY_CORNER_RADIUS_PERCENT, 50f)
-                .putFloat(GLOBAL + ConfigContract.KEY_CORNER_SMOOTHING, -1f)
-                .putFloat(GLOBAL + ConfigContract.KEY_BAR_HEIGHT, 56f)
-            changed = true
+        // A first launch must export a versioned snapshot before any manual toggle.
+        if (changed || !p.contains("revision")) {
+            edit.putLong("revision", maxOf(System.currentTimeMillis(), p.getLong("revision", 0L) + 1L))
+            check(edit.commit()) { "Initial settings export failed" }
         }
-        if (!p.getBoolean("manager_defaults_20261002", false)) {
-            edit.putBoolean("manager_defaults_20261002", true)
-                .putFloat(GLOBAL + ConfigContract.KEY_DARK_BAR_HIGHLIGHT_STRENGTH, 0.5f)
-            changed = true
-        }
-        if (changed) edit.apply()
+        synchronized(this) { ModernSettingsBridge.publish(p) }
     }
 
     fun setSolidBarEnabled(context: Context, value: Boolean) {
@@ -299,9 +333,14 @@ object LocalSettings {
         }
     }
 
-    fun setAppConfig(context: Context, packageName: String, value: GlassConfig) = edit(context) {
+    fun setAppConfig(context: Context, packageName: String, value: GlassConfig, spotifyNativeOrigin: Boolean = false) = edit(context) {
+        if (packageName == "com.spotify.music") {
+            val old = configFor(context, packageName)
+            putBoolean(appPrefix(packageName) + ConfigContract.KEY_SPOTIFY_CREATE_COMMAND,
+                !spotifyNativeOrigin && (old.spotifyCreateCommand || ((old.hiddenMask xor value.hiddenMask) and 16 != 0)))
+        }
         putBoolean(overrideKey(packageName), true)
-        writeConfig(appPrefix(packageName), value.normalized())
+        writeConfig(appPrefix(packageName), value.normalized(packageName))
     }
 
     fun clearAppConfig(context: Context, packageName: String) = edit(context) {
@@ -317,22 +356,54 @@ object LocalSettings {
     }
 
     private fun readConfig(p: SharedPreferences, prefix: String, defaults: GlassConfig): GlassConfig = GlassConfig(
+        postureEffectsEnabled = p.getBoolean(GLOBAL + ConfigContract.KEY_POSTURE_EFFECTS, false),
+        indicatorInteractionLightEnabled = p.getBoolean(GLOBAL + ConfigContract.KEY_INDICATOR_INTERACTION_LIGHT, true),
+        simplifyTabSwitch = p.getBoolean(GLOBAL + ConfigContract.KEY_SIMPLIFY_TAB_SWITCH, GlassConfig.DEFAULT_SIMPLIFY_TAB_SWITCH),
+        liquidViscosity = p.getFloat(GLOBAL + ConfigContract.KEY_LIQUID_VISCOSITY, 25f),
+        refractionStrength = p.getFloat(GLOBAL + ConfigContract.KEY_REFRACTION_STRENGTH, GlassConfig.DEFAULT_REFRACTION_STRENGTH),
+        flowHorizontalStrength = p.getFloat(GLOBAL + ConfigContract.KEY_FLOW_HORIZONTAL, 100f),
+        flowVerticalStrength = p.getFloat(GLOBAL + ConfigContract.KEY_FLOW_VERTICAL, 100f),
         classicNavigation = if (prefix == GLOBAL) p.getBoolean(GLOBAL + ConfigContract.KEY_CLASSIC_NAVIGATION, false) else defaults.classicNavigation,
+        bottomBarIconOnly = p.getBoolean(GLOBAL + ConfigContract.KEY_BOTTOM_BAR_ICON_ONLY, GlassConfig.DEFAULT_BOTTOM_BAR_ICON_ONLY),
         enabled = defaults.enabled,
         themeMode = p.getInt(prefix + ConfigContract.KEY_THEME_MODE, defaults.themeMode),
         tabWidth = p.getFloat(prefix + ConfigContract.KEY_TAB_WIDTH, defaults.tabWidth),
         bottomPadding = p.getFloat(prefix + ConfigContract.KEY_BOTTOM_PADDING, defaults.bottomPadding),
         blurRadius = p.getFloat(prefix + ConfigContract.KEY_BLUR_RADIUS, defaults.blurRadius),
+        // configFor/snapshot force legacy blurRadius to the global value. Inherit that
+        // effective value until a dedicated SystemUI value has actually been saved.
         cornerRadiusPercent = p.getFloat(prefix + ConfigContract.KEY_CORNER_RADIUS_PERCENT, defaults.cornerRadiusPercent),
         cornerSmoothing = p.getFloat(prefix + ConfigContract.KEY_CORNER_SMOOTHING, defaults.cornerSmoothing),
         barHeight = p.getFloat(prefix + ConfigContract.KEY_BAR_HEIGHT, defaults.barHeight),
         lightAlpha = p.getFloat(prefix + ConfigContract.KEY_LIGHT_ALPHA, defaults.lightAlpha),
         darkAlpha = p.getFloat(prefix + ConfigContract.KEY_DARK_ALPHA, defaults.darkAlpha),
         darkBarHighlightStrength = p.getFloat(prefix + ConfigContract.KEY_DARK_BAR_HIGHLIGHT_STRENGTH, defaults.darkBarHighlightStrength),
+        highlightTransparency = p.getFloat(prefix + ConfigContract.KEY_HIGHLIGHT_TRANSPARENCY, defaults.highlightTransparency),
         iconScale = p.getFloat(prefix + ConfigContract.KEY_ICON_SCALE, defaults.iconScale),
         textSize = p.getFloat(prefix + ConfigContract.KEY_TEXT_SIZE, defaults.textSize),
         iconOnly = p.getBoolean(prefix + ConfigContract.KEY_ICON_ONLY, defaults.iconOnly),
         hiddenMask = p.getInt(prefix + ConfigContract.KEY_HIDDEN_MASK, defaults.hiddenMask),
+        detachedPublish = p.getBoolean(prefix + ConfigContract.KEY_DETACHED_PUBLISH, defaults.detachedPublish),
+        meituanDetachedXiaotuan = p.getBoolean(prefix + ConfigContract.KEY_MEITUAN_DETACHED_XIAOTUAN, defaults.meituanDetachedXiaotuan),
+        bilibiliSolidTopGradient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_SOLID_TOP_GRADIENT, defaults.bilibiliSolidTopGradient),
+        bilibiliBottomColorGradient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_BOTTOM_COLOR_GRADIENT, defaults.bilibiliBottomColorGradient),
+        bilibiliTopBar = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_TOP_BAR, defaults.bilibiliTopBar),
+        bilibiliEdgeToEdgeFeed = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_EDGE_TO_EDGE_FEED, defaults.bilibiliEdgeToEdgeFeed),
+        bilibiliInDetachedSearch = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_IN_DETACHED_SEARCH, defaults.bilibiliInDetachedSearch),
+        bilibiliDetachedSearch = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_DETACHED_SEARCH, defaults.bilibiliDetachedSearch),
+        bilibiliInVideoAmbient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_IN_VIDEO_AMBIENT, defaults.bilibiliInVideoAmbient),
+        bilibiliVideoAmbient = p.getBoolean(prefix + ConfigContract.KEY_BILIBILI_VIDEO_AMBIENT, defaults.bilibiliVideoAmbient),
+        douyinTopBar = p.getBoolean(prefix + ConfigContract.KEY_DOUYIN_TOP_BAR, defaults.douyinTopBar),
+        tiktokTopBar = p.getBoolean(prefix + ConfigContract.KEY_TIKTOK_TOP_BAR, defaults.tiktokTopBar),
+        xhsTopBar = p.getBoolean(prefix + ConfigContract.KEY_XHS_TOP_BAR, defaults.xhsTopBar),
+        xhsEdgeToEdgeFeed = p.getBoolean(prefix + ConfigContract.KEY_XHS_EDGE_TO_EDGE_FEED, defaults.xhsEdgeToEdgeFeed),
+        weiboHomeTopBar = p.getBoolean(prefix + ConfigContract.KEY_WEIBO_HOME_TOP_BAR, defaults.weiboHomeTopBar),
+        managerEnglishNavigationLabels = if (prefix == GLOBAL)
+            ManagerLanguage.fromValue(p.getString("manager_language", null)) == ManagerLanguage.ENGLISH
+            else defaults.managerEnglishNavigationLabels,
+        tiktokPinnedTabs = p.getString(prefix + ConfigContract.KEY_TIKTOK_PINNED_TABS, defaults.tiktokPinnedTabs).orEmpty(),
+        douyinPinnedTabs = p.getString(prefix + ConfigContract.KEY_DOUYIN_PINNED_TABS, defaults.douyinPinnedTabs).orEmpty(),
+        tiktokTallVideoFill = p.getBoolean(prefix + ConfigContract.KEY_TIKTOK_TALL_VIDEO_FILL, defaults.tiktokTallVideoFill),
         showPostButton = p.getBoolean(prefix + ConfigContract.KEY_SHOW_POST, defaults.showPostButton),
         customAccentEnabled = p.getBoolean(prefix + ConfigContract.KEY_CUSTOM_ACCENT_ENABLED, defaults.customAccentEnabled),
         customAccentColor = p.getInt(prefix + ConfigContract.KEY_CUSTOM_ACCENT_COLOR, defaults.customAccentColor),
@@ -340,6 +411,18 @@ object LocalSettings {
         backdropCapture = p.getBoolean(prefix + ConfigContract.KEY_BACKDROP_CAPTURE, defaults.backdropCapture),
         nativeBlur = p.getBoolean(prefix + ConfigContract.KEY_NATIVE_BLUR, defaults.nativeBlur),
         selectedAccent = p.getBoolean(prefix + ConfigContract.KEY_SELECTED_ACCENT, defaults.selectedAccent),
+        spotifyBarOpacity = p.getFloat(prefix + ConfigContract.KEY_SPOTIFY_BAR_OPACITY, defaults.spotifyBarOpacity),
+        shortVideoBarOpacity = p.getFloat(prefix + ConfigContract.KEY_SHORT_VIDEO_BAR_OPACITY, defaults.shortVideoBarOpacity),
+        spotifyProgressFill = p.getBoolean(prefix + ConfigContract.KEY_SPOTIFY_PROGRESS_FILL, defaults.spotifyProgressFill),
+        wechatFoldPlanB = p.getBoolean(prefix + ConfigContract.KEY_WECHAT_FOLD_PLAN_B, defaults.wechatFoldPlanB),
+        wechatTopBarReconstruction = p.getBoolean(prefix + ConfigContract.KEY_WECHAT_TOP_BAR_RECONSTRUCTION, defaults.wechatTopBarReconstruction),
+        wechatTopBlurGradient = p.getBoolean(prefix + ConfigContract.KEY_WECHAT_TOP_BLUR_GRADIENT, defaults.wechatTopBlurGradient),
+        xAutoHideBar = p.getBoolean(prefix + ConfigContract.KEY_X_AUTO_HIDE_BAR, defaults.xAutoHideBar),
+        miHealthSimplifyMine = p.getBoolean(prefix + ConfigContract.KEY_MI_HEALTH_SIMPLIFY_MINE, defaults.miHealthSimplifyMine),
+        miHealthIosIcons = p.getBoolean(prefix + ConfigContract.KEY_MI_HEALTH_IOS_ICONS, defaults.miHealthIosIcons),
+        spotifyThreeTabFullWidth = p.getBoolean(prefix + ConfigContract.KEY_SPOTIFY_THREE_TAB_FULL_WIDTH, defaults.spotifyThreeTabFullWidth),
+        spotifyPremiumAvailable = p.getBoolean(prefix + ConfigContract.KEY_SPOTIFY_PREMIUM_AVAILABLE, defaults.spotifyPremiumAvailable),
+        spotifyCreateCommand = p.getBoolean(prefix + ConfigContract.KEY_SPOTIFY_CREATE_COMMAND, false),
         liquidGlassEnabled = defaults.liquidGlassEnabled,
         bottomGradientBlurEnabled = defaults.bottomGradientBlurEnabled,
         solidBarEnabled = defaults.solidBarEnabled,
@@ -347,7 +430,15 @@ object LocalSettings {
     ).normalized()
 
     private fun SharedPreferences.Editor.writeConfig(prefix: String, value: GlassConfig) {
+        putBoolean(prefix + ConfigContract.KEY_POSTURE_EFFECTS, value.postureEffectsEnabled)
+        putBoolean(prefix + ConfigContract.KEY_INDICATOR_INTERACTION_LIGHT, value.indicatorInteractionLightEnabled)
+        putBoolean(prefix + ConfigContract.KEY_SIMPLIFY_TAB_SWITCH, value.simplifyTabSwitch)
+        putFloat(prefix + ConfigContract.KEY_LIQUID_VISCOSITY, value.liquidViscosity)
+        if (prefix == GLOBAL) putFloat(prefix + ConfigContract.KEY_REFRACTION_STRENGTH, value.refractionStrength)
+        putFloat(prefix + ConfigContract.KEY_FLOW_HORIZONTAL, value.flowHorizontalStrength)
+        putFloat(prefix + ConfigContract.KEY_FLOW_VERTICAL, value.flowVerticalStrength)
         if (prefix == GLOBAL) putBoolean(prefix + ConfigContract.KEY_CLASSIC_NAVIGATION, value.classicNavigation)
+        if (prefix == GLOBAL) putBoolean(prefix + ConfigContract.KEY_BOTTOM_BAR_ICON_ONLY, value.bottomBarIconOnly)
         putInt(prefix + ConfigContract.KEY_THEME_MODE, value.themeMode)
         putFloat(prefix + ConfigContract.KEY_TAB_WIDTH, value.tabWidth)
         putFloat(prefix + ConfigContract.KEY_BOTTOM_PADDING, value.bottomPadding)
@@ -358,10 +449,30 @@ object LocalSettings {
         putFloat(prefix + ConfigContract.KEY_LIGHT_ALPHA, value.lightAlpha)
         putFloat(prefix + ConfigContract.KEY_DARK_ALPHA, value.darkAlpha)
         putFloat(prefix + ConfigContract.KEY_DARK_BAR_HIGHLIGHT_STRENGTH, value.darkBarHighlightStrength)
+        putFloat(prefix + ConfigContract.KEY_HIGHLIGHT_TRANSPARENCY, value.highlightTransparency)
         putFloat(prefix + ConfigContract.KEY_ICON_SCALE, value.iconScale)
         putFloat(prefix + ConfigContract.KEY_TEXT_SIZE, value.textSize)
         putBoolean(prefix + ConfigContract.KEY_ICON_ONLY, value.iconOnly)
         putInt(prefix + ConfigContract.KEY_HIDDEN_MASK, value.hiddenMask)
+        putBoolean(prefix + ConfigContract.KEY_DETACHED_PUBLISH, value.detachedPublish)
+        putBoolean(prefix + ConfigContract.KEY_MEITUAN_DETACHED_XIAOTUAN, value.meituanDetachedXiaotuan)
+        putBoolean(prefix + ConfigContract.KEY_BILIBILI_SOLID_TOP_GRADIENT, value.bilibiliSolidTopGradient)
+        putBoolean(prefix + ConfigContract.KEY_BILIBILI_BOTTOM_COLOR_GRADIENT, value.bilibiliBottomColorGradient)
+        putBoolean(prefix + ConfigContract.KEY_BILIBILI_TOP_BAR, value.bilibiliTopBar)
+        putBoolean(prefix + ConfigContract.KEY_BILIBILI_EDGE_TO_EDGE_FEED, value.bilibiliEdgeToEdgeFeed)
+        putBoolean(prefix + ConfigContract.KEY_BILIBILI_IN_DETACHED_SEARCH, value.bilibiliInDetachedSearch)
+        putBoolean(prefix + ConfigContract.KEY_BILIBILI_DETACHED_SEARCH, value.bilibiliDetachedSearch)
+        putBoolean(prefix + ConfigContract.KEY_BILIBILI_IN_VIDEO_AMBIENT, value.bilibiliInVideoAmbient)
+        putBoolean(prefix + ConfigContract.KEY_BILIBILI_VIDEO_AMBIENT, value.bilibiliVideoAmbient)
+        putBoolean(prefix + ConfigContract.KEY_DOUYIN_TOP_BAR, value.douyinTopBar)
+        putBoolean(prefix + ConfigContract.KEY_TIKTOK_TOP_BAR, value.tiktokTopBar)
+        putBoolean(prefix + ConfigContract.KEY_XHS_TOP_BAR, value.xhsTopBar)
+        putBoolean(prefix + ConfigContract.KEY_XHS_EDGE_TO_EDGE_FEED, value.xhsEdgeToEdgeFeed)
+        putBoolean(prefix + ConfigContract.KEY_WEIBO_HOME_TOP_BAR, value.weiboHomeTopBar)
+        if (prefix == GLOBAL) putBoolean(prefix + ConfigContract.KEY_MANAGER_ENGLISH_LABELS, value.managerEnglishNavigationLabels)
+        putString(prefix + ConfigContract.KEY_TIKTOK_PINNED_TABS, value.tiktokPinnedTabs)
+        putString(prefix + ConfigContract.KEY_DOUYIN_PINNED_TABS, value.douyinPinnedTabs)
+        putBoolean(prefix + ConfigContract.KEY_TIKTOK_TALL_VIDEO_FILL, value.tiktokTallVideoFill)
         putBoolean(prefix + ConfigContract.KEY_SHOW_POST, value.showPostButton)
         putBoolean(prefix + ConfigContract.KEY_CUSTOM_ACCENT_ENABLED, value.customAccentEnabled)
         putInt(prefix + ConfigContract.KEY_CUSTOM_ACCENT_COLOR, value.customAccentColor)
@@ -369,11 +480,59 @@ object LocalSettings {
         putBoolean(prefix + ConfigContract.KEY_BACKDROP_CAPTURE, value.backdropCapture)
         putBoolean(prefix + ConfigContract.KEY_NATIVE_BLUR, value.nativeBlur)
         putBoolean(prefix + ConfigContract.KEY_SELECTED_ACCENT, value.selectedAccent)
+        putFloat(prefix + ConfigContract.KEY_SPOTIFY_BAR_OPACITY, value.spotifyBarOpacity)
+        putFloat(prefix + ConfigContract.KEY_SHORT_VIDEO_BAR_OPACITY, value.shortVideoBarOpacity)
+        putBoolean(prefix + ConfigContract.KEY_SPOTIFY_PROGRESS_FILL, value.spotifyProgressFill)
+        putBoolean(prefix + ConfigContract.KEY_WECHAT_FOLD_PLAN_B, value.wechatFoldPlanB)
+        putBoolean(prefix + ConfigContract.KEY_WECHAT_TOP_BAR_RECONSTRUCTION, value.wechatTopBarReconstruction)
+        putBoolean(prefix + ConfigContract.KEY_WECHAT_TOP_BLUR_GRADIENT, value.wechatTopBlurGradient)
+        putBoolean(prefix + ConfigContract.KEY_X_AUTO_HIDE_BAR, value.xAutoHideBar)
+        putBoolean(prefix + ConfigContract.KEY_MI_HEALTH_SIMPLIFY_MINE, value.miHealthSimplifyMine)
+        putBoolean(prefix + ConfigContract.KEY_MI_HEALTH_IOS_ICONS, value.miHealthIosIcons)
+        putBoolean(prefix + ConfigContract.KEY_SPOTIFY_THREE_TAB_FULL_WIDTH, value.spotifyThreeTabFullWidth)
+        putBoolean(prefix + ConfigContract.KEY_SPOTIFY_PREMIUM_AVAILABLE, value.spotifyPremiumAvailable)
     }
 
     private inline fun edit(context: Context, block: SharedPreferences.Editor.() -> Unit) {
-        val now = System.currentTimeMillis()
-        prefs(context).edit().apply(block).putLong("revision", now).commit()
+        synchronized(this) {
+        val p = prefs(context)
+        val now = maxOf(System.currentTimeMillis(), p.getLong("revision", 0L) + 1L)
+        check(p.edit().apply(block).putLong("revision", now).commit()) { "Settings commit failed" }
+        }
+        enqueuePublication(context.applicationContext)
+    }
+
+    private val publicationExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { task ->
+        Thread(task, "LiquidTab-SettingsPublish").apply { isDaemon = true }
+    }
+    private val publicationLock = Any()
+    private var publicationDirty = false
+    private var publicationRunning = false
+
+    /** Keep commit/read-your-write on the caller; no IPC fan-out in an animation frame. */
+    private fun enqueuePublication(context: Context) {
+        synchronized(publicationLock) {
+            publicationDirty = true
+            if (publicationRunning) return
+            publicationRunning = true
+        }
+        publicationExecutor.execute {
+            while (true) {
+                synchronized(publicationLock) {
+                    if (!publicationDirty) { publicationRunning = false; return@execute }
+                    publicationDirty = false
+                }
+                try {
+                    publishCommittedSettings(context)
+                } catch (error: Exception) {
+                    android.util.Log.e("LiquidTabSettings", "Configuration publication failed", error)
+                }
+            }
+        }
+    }
+
+    private fun publishCommittedSettings(context: Context) {
+        ModernSettingsBridge.publish(prefs(context))
         context.contentResolver.notifyChange(ConfigContract.URI, null)
         // A provider notification does not wake an otherwise idle injected
         // View, so polling alone cannot make a released slider visible in all
@@ -382,22 +541,22 @@ object LocalSettings {
         AppCatalog.targets.forEach { publishConfig(context, it.packageName) }
     }
 
+    /** Same versioned snapshot for provider, push and cold-start request/reply. */
+    @Synchronized
+    fun configSnapshot(context: Context, packageName: String): android.os.Bundle =
+        configFor(context, packageName).copy(systemDark = SystemTheme.isDark(context))
+            .toBundle(packageName).apply {
+                putLong(ConfigContract.KEY_REVISION, prefs(context).getLong("revision", 0L))
+            }
+
     fun publishConfig(context: Context, packageName: String) {
         val spec = AppCatalog.forPackage(packageName) ?: return
-        val targets = buildList {
-            add(spec.packageName)
-            addAll(spec.aliasPackages)
-        }
-        targets.forEach { targetPackage ->
-            val config = configFor(context, targetPackage).copy(systemDark = isSystemDarkNow())
-            context.sendBroadcast(
-                Intent(ConfigContract.ACTION_CONFIG_RESPONSE)
-                    .setPackage(targetPackage)
-                    .putExtras(config.toBundle(targetPackage)),
-            )
+        (listOf(spec.packageName) + spec.aliasPackages).forEach { targetPackage ->
+            context.sendBroadcast(Intent(ConfigContract.ACTION_CONFIG_RESPONSE)
+                .setPackage(targetPackage)
+                .putExtras(configSnapshot(context, targetPackage)))
         }
     }
-
     fun reportNavigationLabels(context: Context, packageName: String, labels: List<String>) {
         if (AppCatalog.forPackage(packageName) == null || labels.size !in 2..7) return
         val value = org.json.JSONArray(labels).toString()
@@ -405,6 +564,23 @@ object LocalSettings {
         val key = "navigation_labels_$packageName"
         if (p.getString(key, null) == value) return
         p.edit().putString(key, value).apply()
+        context.contentResolver.notifyChange(ConfigContract.URI, null)
+    }
+
+    fun reportDouyinTopChannels(context: Context, value: String) {
+        val channels = DouyinTopChannels.decode(value)
+        if (channels.isEmpty()) return
+        val normalized = DouyinTopChannels.encode(channels)
+        val p = prefs(context)
+        if (p.getString(ConfigContract.KEY_DOUYIN_TOP_TABS, null) == normalized) return
+        p.edit().putString(ConfigContract.KEY_DOUYIN_TOP_TABS, normalized).apply()
+        context.contentResolver.notifyChange(ConfigContract.URI, null)
+    }
+
+    fun reportTikTokTopChannels(context: Context, value: String) {
+        val p = prefs(context)
+        if (p.getString(ConfigContract.KEY_TIKTOK_TOP_CHANNELS, null) == value) return
+        p.edit().putString(ConfigContract.KEY_TIKTOK_TOP_CHANNELS, value).apply()
         context.contentResolver.notifyChange(ConfigContract.URI, null)
     }
 
@@ -422,8 +598,10 @@ object LocalSettings {
         val spec = AppCatalog.forPackage(packageName) ?: return global
         return global.copy(
             iconOnly = spec.defaultIconOnly || global.iconOnly,
+            hiddenMask = global.hiddenMask or spec.defaultHiddenMask,
             customAccentColor = spec.defaultAccentColor,
+            detachedPublish = spec.defaultDetachedPublish || global.detachedPublish,
         )
     }
-
 }
+

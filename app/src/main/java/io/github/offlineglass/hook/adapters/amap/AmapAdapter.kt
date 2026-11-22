@@ -1,6 +1,5 @@
 package io.github.offlineglass.hook.adapters.amap
 
-import android.app.Activity
 import android.content.Context
 import android.view.View
 import android.view.ViewGroup
@@ -10,18 +9,21 @@ import io.github.offlineglass.hook.adapters.TargetAdapter
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import io.github.offlineglass.hook.adapters.TargetHookSignal
 import io.github.offlineglass.targets.TargetSpec
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 
-/** Amap LiteTabBar and its separate POI floating action bar. */
+/** Amap main LiteTabBar; secondary-page overlays remain native. */
 internal object AmapAdapter : TargetAdapter {
     override val key = "amap"
     override val ownsNavigationFinding = true
     override val ownsNavigationDrawing = true
     override val ownsNavigationTap = true
-    override val reverseVisualSlotOrder = true
+    override val reverseVisualSlotOrder = false
     override val actionOnlyIndices = setOf(2)
-    override val floatingPillUsesConfiguredHeight = true
     override val floatingPillUsesSharedInsets = true
     override fun createNavigationState(context: Context): AppNavigationState = AmapNavigationState(context)
+    override fun installHooks(lpparam: XC_LoadPackage.LoadPackageParam, spec: TargetSpec) {
+        AmapSplashAd.install(lpparam)
+    }
     override fun suppressNativeBottomChrome(navigation: ViewGroup) {
         runCatching { AmapChrome.suppress(navigation) }
         navigation.post { runCatching { AmapChrome.suppress(navigation) } }
@@ -50,7 +52,4 @@ internal object AmapAdapter : TargetAdapter {
         TargetHookSignal("com.autonavi.bundle.amaphome.page.BootHomeTabPage", listOf("showTab")),
     )
 
-    override fun beforeNavigationScan(activity: Activity) {
-        AmapFloatingActionController.install(activity)
-    }
 }

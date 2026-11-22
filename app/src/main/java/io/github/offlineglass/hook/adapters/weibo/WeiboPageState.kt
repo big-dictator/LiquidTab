@@ -5,10 +5,14 @@ import io.github.offlineglass.hook.GlassHostLayout
 
 internal fun GlassHostLayout.weiboPageAllowsNavigation(): Boolean {
     val state = appNavigationState as? WeiboNavigationState ?: return true
+    if (selectedIndex == MESSAGE_INDEX) {
+        WeiboAdapter.currentTab = MESSAGE_INDEX
+        resetMessageScrollStopState()
+        state.messageSafety.update(this)
+        return true
+    }
     val tabHost = findWeiboTabHost()
-    val currentTab = runCatching {
-        tabHost?.javaClass?.getMethod("getCurrentTab")?.invoke(tabHost) as? Int
-    }.getOrNull() ?: run {
+    val currentTab = tabHost?.currentTab ?: run {
         state.refreshNavigationSource(this)
         return true
     }
@@ -20,8 +24,9 @@ internal fun GlassHostLayout.weiboPageAllowsNavigation(): Boolean {
         }
         MESSAGE_INDEX -> {
             WeiboAdapter.currentTab = currentTab
-            ensureMsgScrollStopHideListener()
-            return !msgScrolledToStop
+            state.messageSafety.update(this)
+            resetMessageScrollStopState()
+            return true
         }
         else -> {
             WeiboAdapter.currentTab = currentTab

@@ -9,10 +9,13 @@ com.mi.health
 com.xiaomi.market
 com.netease.cloudmusic
 com.tencent.qqmusic
+com.spotify.music
+com.apple.android.music
 com.xingin.xhs
 com.xunmeng.pinduoduo
 com.taobao.taobao
 com.ss.android.ugc.aweme
+com.zhiliaoapp.musically
 com.cainiao.wireless
 com.taobao.idlefish
 com.jingdong.app.mall
@@ -22,3 +25,9 @@ com.sina.weibo
 com.tencent.mm
 com.supwisdom.xjtu
 com.zhihu.android
+com.openai.chatgpt
+com.huawei.health
+com.twitter.android
+com.instagram.android
+com.reddit.frontpage
+com.quora.android

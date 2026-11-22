@@ -5,27 +5,23 @@ import android.view.ViewGroup
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.widget.TabHost
 import io.github.offlineglass.hook.GlassHostLayout
 
 /** Resolves Weibo's live controller after its navigation hierarchy is rebuilt. */
-internal fun GlassHostLayout.findWeiboTabHost(): ViewGroup? {
-    val activity = context.unwrapActivity() ?: return null
-    val content = activity.findViewById<ViewGroup>(android.R.id.content) ?: return null
-    val stack = ArrayDeque<View>(); stack += content
-    var mainRadio: View? = null
-    while (stack.isNotEmpty()) {
-        val view = stack.removeLast()
-        val name = viewResourceEntryName(view).orEmpty()
-        if (name == "main_radio" || name == "main_theme_radio") {
-            mainRadio = view; break
-        }
-        if (view is ViewGroup) for (index in 0 until view.childCount) stack += view.getChildAt(index)
+internal fun GlassHostLayout.findWeiboTabHost(): TabHost? {
+    // All native maintabs variants use TabHost, but assign different root IDs.
+    // Bind through the verified native row's ancestry, never a guessed root ID.
+    val source = navigationSource?.takeIf { it.isAttachedToWindow } ?: return null
+    val matches = ArrayList<TabHost>()
+    var parent = source.parent
+    var depth = 0
+    while (parent != null && depth++ < 12) {
+        if (parent is TabHost && parent.tabContentView != null && parent.tabWidget != null)
+            matches += parent
+        parent = parent.parent
     }
-    if (mainRadio == null) {
-        val source = navigationSource?.takeIf { it.isAttachedToWindow } ?: return null
-        return (source.parent as? ViewGroup)?.parent as? ViewGroup
-    }
-    return (mainRadio.parent as? ViewGroup)?.parent as? ViewGroup
+    return matches.singleOrNull()
 }
 
 private fun Context.unwrapActivity(): Activity? {

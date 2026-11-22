@@ -15,7 +15,6 @@ import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
-import android.view.PixelCopy
 import io.github.offlineglass.hook.adapters.AppVideoBackdrop
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.rendering.NativeBackdropBlur
@@ -95,6 +94,15 @@ internal class DouyinVideoSampler(
         // probe slot when its surface is still usable, otherwise walk forward.
         if (now - lastDouyinVideoScanAt < DOUYIN_VIDEO_FIND_INTERVAL_MS) {
             selectDouyinVideoProbe()?.let { return it }
+            // A list page has no player: cache that negative result too.
+            // Previously an empty candidate list forced a full scan every frame.
+            // Native textures are checked before this method; holder callbacks
+            // still invalidate the interval immediately when a player changes.
+            val texture = douyinVideoTextureView
+            if (douyinVideoCandidates.isEmpty() && (texture == null ||
+                    texture.isAttachedToWindow && texture.isShown && texture.isAvailable)) {
+                return null
+            }
             // A swipe can detach the old SurfaceView before the one for the
             // next item is attached. Do not wait out the one-second scan window.
             lastDouyinVideoScanAt = 0L
@@ -321,7 +329,8 @@ internal class DouyinVideoSampler(
 
         // Registered native player textures are part of the ordinary live GPU
         // scene. Capturing them would reintroduce the readback latency.
-        if (DouyinPlayerTextureHooks.activeTexture(host) != null) {
+        if (DouyinPlayerTextureHooks.activeTexture(host) != null ||
+            DouyinPlayerTextureHooks.nativeSceneVisible(host)) {
             if (!nativeTextureActive) {
                 nativeTextureActive = true
                 captureGeneration++
@@ -436,134 +445,9 @@ internal class DouyinVideoSampler(
 
         if (bufferWidth <= 0 || bufferHeight <= 0) return
 
-        // PixelCopy cannot read this player's buffer on the current ROM
-        // (ERROR_SOURCE_NO_DATA). Capture the actual SurfaceControl layer
-        // instead; this includes the decoder's live compositor buffer without
-        // creating another window or touching the control-lift layout.
-        if (requestDouyinSurfaceControlFrame(surfaceView, now)) return
-
-        val targetWidth = max(1, bufferWidth)
-
-        val targetHeight = max(1, bufferHeight)
-
-        val target = douyinVideoScratch
-
-            ?.takeIf { !it.isRecycled && it.width == targetWidth && it.height == targetHeight }
-
-            ?: Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-
-        douyinVideoScratch = null
-
-        douyinVideoCopyInFlight = true
-
-        douyinVideoCopyStartedAt = now
-
-        runCatching {
-
-            PixelCopy.request(
-
-                surfaceView,
-
-                null,
-
-                target,
-
-                { result ->
-
-                    douyinVideoCopyInFlight = false
-
-                    douyinVideoCopyStartedAt = 0L
-
-                    if (result == PixelCopy.SUCCESS && currentHost?.isAttachedToWindow == true &&
-
-                        pageAllowed
-
-                    ) {
-
-                        if (douyinCopySuccessEpoch++ % 20 == 0) {
-
-            douyinVideoDiag(
-                                "copy ok=${target.width}x${target.height} " +
-                                    "surface=${douyinVideoSurfaceWidth}x${douyinVideoSurfaceHeight} " +
-                                    "at=${douyinVideoSurfaceLeft},${douyinVideoSurfaceTop}",
-                            )
-                        }
-
-                        val previous = backdrop
-
-                        backdrop = target
-                        douyinVideoSurfaceLeft = surfaceLocation[0]
-                        douyinVideoSurfaceTop = surfaceLocation[1]
-                        douyinVideoSurfaceWidth = surfaceView.width
-                        douyinVideoSurfaceHeight = surfaceView.height
-
-                        if (previous !== target) {
-
-                            douyinVideoScratch?.takeUnless(Bitmap::isRecycled)?.recycle()
-
-                            douyinVideoScratch = previous
-
-                        }
-
-                        // The display-rate pump in onDraw repaints the glass with
-
-                        // the freshest backdrop; postInvalidateOnAnimation keeps the
-
-                        // transition immediate even while that pump is throttled.
-
-                        currentHost?.postInvalidateOnAnimation()
-
-                    } else {
-                        if (result == PixelCopy.ERROR_SOURCE_INVALID ||
-                            result == PixelCopy.ERROR_SOURCE_NO_DATA
-                        ) {
-                            douyinVideoProbeFails++
-                            if (douyinVideoProbeFails >= 2 && douyinVideoCandidates.size > 1) {
-                                advanceDouyinVideoProbe("copy code=$result")
-                            }
-                        }
-                        if (douyinCopyFailEpoch++ % 5 == 0) {
-            douyinVideoDiag(
-                                "copy fail code=$result idx=$douyinVideoProbeIndex " +
-                                    "cls=${surfaceView.javaClass.simpleName} " +
-                                    "${surfaceView.width}x${surfaceView.height}",
-                            )
-                        }
-
-                        resetDouyinVideoProbe("copy code=$result")
-
-                        if (target !== backdrop) {
-
-                            douyinVideoScratch?.takeUnless(Bitmap::isRecycled)?.recycle()
-
-                            douyinVideoScratch = target
-
-                        }
-
-                    }
-
-                },
-                mainHandler,
-            )
-
-        }.onFailure { t ->
-
-            douyinVideoDiag("copy sync fail: ${t::class.java.simpleName}: ${t.message}")
-
-            douyinVideoCopyInFlight = false
-
-            douyinVideoCopyStartedAt = 0L
-
-            if (target !== backdrop) {
-
-                douyinVideoScratch?.takeUnless(Bitmap::isRecycled)?.recycle()
-
-                douyinVideoScratch = target
-
-            }
-
+        if (!requestDouyinSurfaceControlFrame(surfaceView, now)) {
+            sampleDouyinVideoTextureViewFrame()
         }
-
     }
 
     private var douyinOpticalDrawEpoch = -1

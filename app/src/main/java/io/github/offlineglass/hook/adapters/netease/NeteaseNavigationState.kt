@@ -11,9 +11,10 @@ import android.view.ViewGroup
 import android.view.MotionEvent
 import android.os.SystemClock
 import io.github.offlineglass.hook.GlassHostLayout
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.adapters.localizeNavigationLabel
 
 /** Per-host NetEase navigation artwork and geometry. */
 internal class NeteaseNavigationState(
@@ -25,6 +26,25 @@ internal class NeteaseNavigationState(
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     }
     private var navigationHeightPx = 0
+    private var lastWallpaperThemeCheck = 0L
+    private var customWallpaperTheme = false
+    private var wallpaperThemeGetter: java.lang.reflect.Method? = null
+    private var wallpaperThemeInstance: Any? = null
+
+    private fun hasCustomWallpaperTheme(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastWallpaperThemeCheck < 480L) return customWallpaperTheme
+        lastWallpaperThemeCheck = now
+        if (wallpaperThemeGetter == null) runCatching {
+            val router = Class.forName("com.netease.cloudmusic.theme.core.ResourceRouter", false, context.classLoader)
+            wallpaperThemeInstance = router.getMethod("getInstance").invoke(null)
+            wallpaperThemeGetter = router.getMethod("isCustomBgTheme")
+        }
+        customWallpaperTheme = runCatching {
+            wallpaperThemeGetter?.invoke(wallpaperThemeInstance) == true
+        }.getOrDefault(false)
+        return customWallpaperTheme
+    }
 
     override fun onHostPreDraw(
         host: View,
@@ -98,6 +118,7 @@ internal class NeteaseNavigationState(
     override fun suppressRedrawnSource() = activeHost?.neteaseRuntime?.hasNavigationBar
     override fun forceDarkMode(selectedIndex: Int): Boolean? =
         if (selectedIndex == 0 && activeHost?.neteaseRuntime?.heartbeatActive == true) true
+        else if (hasCustomWallpaperTheme()) true
         else (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
             Configuration.UI_MODE_NIGHT_YES
 
@@ -163,7 +184,7 @@ internal class NeteaseNavigationState(
             labelPaint.alpha = 255
             canvas.save()
             canvas.scale(itemScale, itemScale, centerX, navTop + navHeight / 2f)
-            canvas.drawText(LABELS.getOrElse(index) { "" }, centerX, baseline, labelPaint)
+            canvas.drawText(frame.localizeNavigationLabel(LABELS.getOrElse(index) { "" }), centerX, baseline, labelPaint)
             canvas.restore()
         }
     }

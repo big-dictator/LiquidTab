@@ -11,8 +11,9 @@ android {
         applicationId = "io.github.offlineglass"
         minSdk = 35
         targetSdk = 37
-        versionCode = 217
-        versionName = "2.0"
+        versionCode = 225
+        versionName = "2.1.2"
+        buildConfigField("Boolean", "BETA_BUILD", "false")
 
         vectorDrawables.useSupportLibrary = true
     }
@@ -32,6 +33,7 @@ android {
     }
 
     packaging {
+        jniLibs.useLegacyPackaging = false
         resources.excludes += setOf(
             "/META-INF/{AL2.0,LGPL2.1}",
             "META-INF/versions/**"
@@ -78,6 +80,7 @@ dependencies {
     implementation("top.yukonga.miuix.kmp:miuix-squircle-android:0.9.3")
     implementation("top.yukonga.miuix.kmp:miuix-navigation3-ui-android:0.9.3")
 
-    compileOnly(project(":xposed-stubs"))
+    compileOnly("io.github.libxposed:api:101.0.1")
+    implementation("io.github.libxposed:service:101.0.0")
     implementation("org.lsposed.hiddenapibypass:hiddenapibypass:6.1")
 }

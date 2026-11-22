@@ -1,11 +1,13 @@
 package io.github.offlineglass.hook.adapters.jd
 
+
 import android.os.SystemClock
 import android.graphics.RenderEffect
 import android.graphics.RuntimeShader
 import android.view.View
 import android.view.ViewGroup
 import io.github.offlineglass.hook.GlassHostLayout
+import io.github.offlineglass.hook.adapters.AdapterOwnedOverlay
 import java.lang.ref.WeakReference
 import kotlin.math.roundToInt
 
@@ -29,6 +31,7 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
         shaderFactory: () -> RuntimeShader?,
     ) {
         if (!liquidGlassEnabled) {
+            io.github.offlineglass.rendering.PostureGlass.track(view, false)
             view.setRenderEffect(null)
             invalidateOuterEffect()
             view.invalidate()
@@ -36,18 +39,25 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
         }
         val width = targetWidth.coerceAtLeast(1)
         val height = targetHeight.coerceAtLeast(1)
+        val postureEnabled = host.config.postureEffectsEnabled && liquidGlassEnabled
+        val shader = outerShader ?: shaderFactory()?.also { outerShader = it } ?: return
+        // The effect graph stays cached while the sensor moves. Updating this
+        // uniform changes only the pixels sampled through the lens; it does not
+        // alter the native bar, hidden-layer, or icon geometry.
+        io.github.offlineglass.rendering.PostureGlass.sync(shader, view, postureEnabled,
+            host.config.liquidViscosity, host.config.flowHorizontalStrength, host.config.flowVerticalStrength)
         val signature = (width.toLong() shl 32) xor height.toLong() xor
             (blurRadius * 100f).roundToInt().toLong() xor
-            ((cornerRadiusPercent * 100f).roundToInt().toLong() shl 12)
+            ((cornerRadiusPercent * 100f).roundToInt().toLong() shl 12) xor
+            (host.config.refractionStrength.toRawBits().toLong() shl 24)
         if (signature == outerEffectSignature) return
-        val shader = outerShader ?: shaderFactory()?.also { outerShader = it } ?: return
         outerEffectSignature = signature
         val corner = minOf(width, height) * (cornerRadiusPercent / 100f)
         shader.setFloatUniform("size", width.toFloat(), height.toFloat())
         shader.setFloatUniform("offset", 0f, 0f)
         shader.setFloatUniform("cornerRadii", corner, corner, corner, corner)
         shader.setFloatUniform("refractionHeight", 24f * density)
-        shader.setFloatUniform("refractionAmount", -24f * density)
+        shader.setFloatUniform("refractionAmount", -24f * density * host.config.refractionScale)
         shader.setFloatUniform("depthEffect", 0f)
         view.setRenderEffect(RenderEffect.createRuntimeShaderEffect(shader, "content"))
         view.invalidate()
@@ -59,7 +69,19 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
     private var lastSuppressAt = Long.MIN_VALUE
     private val sourceLocation = IntArray(2)
     private val chromeLocation = IntArray(2)
+    private fun isModuleLayer(view: View): Boolean = view === host ||
+        view is GlassHostLayout || view is AdapterOwnedOverlay ||
+        view is android.view.SurfaceView || view is android.view.TextureView
     private var resumeGeneration = 0
+    private val browseVisibility = java.util.WeakHashMap<View, Int>()
+
+    fun hideBrowse(row: JdNavigationBinding.Row) {
+        val button = row.slots[JdNavigationBinding.BROWSE].button
+        if (button.visibility == View.VISIBLE) {
+            browseVisibility.putIfAbsent(button, button.visibility)
+            button.visibility = View.INVISIBLE
+        }
+    }
 
     fun onWindowResumed(onSettled: () -> Unit = {}) {
         val generation = ++resumeGeneration
@@ -86,7 +108,7 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
 
     private fun discoverDecorations(source: ViewGroup) {
         decorations.clear()
-        val parent = source.parent as? ViewGroup ?: return
+        val parent = source.parent as? ViewGroup ?: run { JdHiddenNavigationBlur.release(host); return }
         decorationParent = WeakReference(parent)
         decorationChildCount = parent.childCount
         // Native navigation decorations can draw an ImageView drawable or
@@ -105,9 +127,16 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
                 view is android.webkit.WebView) continue
             val name = view.javaClass.name
             if (name == "com.jingdong.app.mall.navigationbar.BottomCropImage" ||
-                name == "com.jingdong.app.mall.navigationbar.refactor.view.AiTabSelectShadow") {
+                name == "com.jingdong.app.mall.navigationbar.refactor.view.AiTabSelectShadow" ||
+                name == "com.jingdong.app.mall.navigationbar.refactor.view.BottomGradientMask" ||
+                name == "com.jingdong.app.mall.navigationbar.refactor.view.BottomBgBlur" ||
+                name == "com.jingdong.app.mall.navigationbar.refactor.view.NavBgBlur") {
+                if (name.endsWith(".AiTabSelectShadow"))
+                    JdNavigationBinding.resolve(source)?.hideSelectionShadow()
                 decorations += WeakReference(view)
                 view.alpha = 0f
+                if (name.endsWith(".NavBgBlur") || name.endsWith(".BottomBgBlur"))
+                    JdHiddenNavigationBlur.suspend(view, host)
                 continue
             }
             val simple = view.javaClass.simpleName
@@ -116,6 +145,7 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
                 for (index in 0 until view.childCount) stack += view.getChildAt(index) to depth + 1
             }
         }
+        JdHiddenNavigationBlur.release(host, decorations)
     }
 
     private fun suppressDecorations(source: ViewGroup) {
@@ -169,6 +199,10 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
         if (lastSuppressedSource?.get() === source && now - lastSuppressAt < 8L) return
         if (lastSuppressedSource?.get() !== source) lastSuppressedSource = WeakReference(source)
         lastSuppressAt = now
+        // JD may restore its shell background on a tab/theme transaction, not
+        // only on Activity resume. Clear the verified short ancestors before
+        // every submitted frame; unchanged properties do not invalidate.
+        clearRestoredMask(source)
 
 
 
@@ -204,6 +238,7 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
             for (i in 0 until parent.childCount) {
 
                 val sibling = parent.getChildAt(i)
+                if (isModuleLayer(sibling)) continue
 
                 val location = chromeLocation
                 sibling.getLocationInWindow(location)
@@ -250,7 +285,13 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
 
                 loc[1] >= chromeTop && loc[1] + ancestor.height >= sourceTop
 
-            if (isShortBarShell) {
+            var moduleParent: View? = host
+            var containsHost = false
+            repeat(8) {
+                if (moduleParent === ancestor) containsHost = true
+                moduleParent = moduleParent?.parent as? View
+            }
+            if (isShortBarShell && !containsHost && !isModuleLayer(ancestor)) {
 
                 if (ancestor.alpha != 0f) ancestor.alpha = 0f
 
@@ -277,6 +318,11 @@ internal class JdNativeChrome(private val host: GlassHostLayout) {
     }
 
     fun reset() {
+        JdHiddenNavigationBlur.release(host)
+        browseVisibility.forEach { (button, visibility) ->
+            if (button.visibility == View.INVISIBLE) button.visibility = visibility
+        }
+        browseVisibility.clear()
         resumeGeneration++
         decorationParent = null
         decorationChildCount = -1

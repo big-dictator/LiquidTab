@@ -10,19 +10,84 @@ import android.view.ViewGroup
 import android.widget.ImageView
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import io.github.offlineglass.hook.GlassHostLayout
+import io.github.offlineglass.hook.adapters.meituan.MeituanTakeoutContract.Role
 
 /** The promotion and iv_top_arc are separate native ImageViews, not one asset. */
-internal class MeituanTakeoutNavigationState : AppNavigationState {
+internal class MeituanTakeoutNavigationState(
+    private val pageHost: GlassHostLayout? = null,
+) : AppNavigationState {
     private val orderViewport = MeituanTakeoutOrderViewport()
     private val profileSafety = MeituanTakeoutProfileSafety()
     private var wasOnProfile = false
+    private var nativeBinding: MeituanTakeoutBinding? = null
+    private var snapshotBinding: MeituanTakeoutBinding? = null
+    private var capturedPromotionIndex = -1
+    private var capturedPromotionAvailable = false
+    private var promotionArtworkReady = false
+    override fun isNavigationEntryAvailable(index: Int): Boolean? {
+        val graph = nativeBinding
+        val campaignIndex = graph?.index(Role.PROMOTION) ?: capturedPromotionIndex
+        if (index != campaignIndex || campaignIndex < 0) return null
+        // While rebinding, retain committed visuals; stale input is separately
+        // refused. A withdrawn live campaign loses its hit target immediately.
+        return capturedPromotionAvailable && (graph?.slots?.getOrNull(index)?.activePromotion ?: true)
+    }
+    private val chrome = MeituanTakeoutChrome()
+    private var ownsVisuals = false
+    private fun binding(source: ViewGroup?): MeituanTakeoutBinding? {
+        val next = nativeBinding?.takeIf { it.row === source && it.valid() }
+            ?: MeituanTakeoutBinding.forRow(source)
+        if (next !== nativeBinding) {
+            orderViewport.release(); profileSafety.release()
+            nativeBinding?.release(); nativeBinding = next
+        }
+        if (next != null && pageHost?.config?.enabled != false) ownsVisuals = true
+        return next
+    }
+    override fun prepare(source: ViewGroup?, schedule: (Long, () -> Unit) -> Unit) { binding(source) }
+    override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int? = binding(source)?.selected()
+    override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
+        val graph = binding(source) ?: return false
+        if (snapshotBinding !== graph) return false
+        val cell = graph.slots.getOrNull(index) ?: return false
+        if (cell.role == Role.PROMOTION && !cell.activePromotion) {
+            graph.report("native campaign delivery absent; refusing hidden uninitialized web route")
+            return false
+        }
+        val button = cell.button()?.takeIf { it.isAttachedToWindow && it.isEnabled } ?: return false
+        val dispatched = button.performClick()
+        if (cell.role == Role.PROMOTION) runCatching {
+            java.io.File(host.context.getExternalFilesDir(null), "liquidtab-takeout-promotion-tap.txt")
+                .writeText("pid=${android.os.Process.myPid()} dispatched=$dispatched nativeSelected=${graph.selected()}\n")
+        }
+        return dispatched
+    }
+    override fun allowsHostTouch(): Boolean = nativeBinding?.valid() == true && snapshotBinding === nativeBinding
+    override fun acceptCapturedNavigation(source: ViewGroup?, target: Bitmap, selectedIndex: Int): Boolean {
+        val graph = binding(source) ?: return false
+        val campaignIndex = graph.index(Role.PROMOTION)
+        val campaign = graph.slots.getOrNull(campaignIndex)
+        if (campaign?.activePromotion == true && !promotionArtworkReady) {
+            graph.report("promotion artwork not ready; retaining committed navigation")
+            return false
+        }
+        snapshotBinding = graph
+        capturedPromotionIndex = campaignIndex
+        capturedPromotionAvailable = campaign?.activePromotion == true && promotionArtworkReady
+        graph.describeBoundNavigation(pageHost)
+        return true
+    }
+    override fun retainNavigationWhenNativeRowHidden(selectedIndex: Int) = ownsVisuals
+    override fun retainNavigationWithoutNativeSource(selectedIndex: Int) = ownsVisuals
+    override fun skipNavigationSnapshotCapture(source: ViewGroup, snapshot: Bitmap?, touching: Boolean,
+        visualAnimating: Boolean, slotCount: Int, now: Long): Boolean? = if (binding(source) == null) true else null
     private val ordinaryGroupCenters = FloatArray(5) { Float.NaN }
 
     override fun sourceContentOffsetY(
         index: Int, selectedIndex: Int, hostHeight: Int,
         transformDy: Float, transformScale: Float,
     ): Float? {
-        if (index == 2) return null
+        if (index == nativeBinding?.index(Role.PROMOTION)) return null
         val center = ordinaryGroupCenters.getOrNull(index)?.takeIf { it.isFinite() } ?: return null
         return hostHeight / 2f - transformDy - center * transformScale
     }
@@ -39,15 +104,13 @@ internal class MeituanTakeoutNavigationState : AppNavigationState {
     }
 
     override fun captureNavigation(source: ViewGroup, target: Bitmap): Boolean {
-        if (source.childCount != 5) return false
-        val id = source.resources.getIdentifier("icon_normal", "id", source.context.packageName)
-        if (id == 0) return false
+        val graph = binding(source) ?: return false
         val transforms = mutableListOf<IconTransform>()
         val clipping = linkedMapOf<ViewGroup, Pair<Boolean, Boolean>>()
         val sourceAlpha = source.alpha
         try {
-            for (index in intArrayOf(0, 1, 3, 4)) {
-                val icon = source.getChildAt(index).findViewById<ImageView>(id) ?: continue
+            for (cell in graph.slots.filter { it.role != Role.PROMOTION }) {
+                val icon = cell.icon ?: continue
                 if (icon.visibility != View.VISIBLE || icon.drawable == null ||
                     icon.width <= 0 || icon.height <= 0) continue
                 val image = Bitmap.createBitmap(icon.width, icon.height, Bitmap.Config.ARGB_8888)
@@ -82,7 +145,19 @@ internal class MeituanTakeoutNavigationState : AppNavigationState {
             val canvas = Canvas(target)
             canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
             if (sourceAlpha < .01f) source.alpha = 1f
-            source.draw(canvas)
+            // A hidden campaign makes the native LinearLayout redistribute the
+            // remaining four children. Project each verified native cell into
+            // its own stable slot instead of copying that compacted layout.
+            for ((index, cell) in graph.slots.withIndex()) {
+                if (cell.role == Role.PROMOTION || cell.root.visibility != View.VISIBLE ||
+                    cell.root.width <= 0 || cell.root.height <= 0) continue
+                val save = canvas.save()
+                try {
+                    val center = (index + .5f) * target.width / graph.slots.size
+                    canvas.translate(center - cell.root.width / 2f, cell.root.top.toFloat())
+                    cell.root.draw(canvas)
+                } finally { canvas.restoreToCount(save) }
+            }
             measureOrdinaryGroups(source, target)
         } finally {
             source.alpha = sourceAlpha
@@ -96,11 +171,11 @@ internal class MeituanTakeoutNavigationState : AppNavigationState {
     }
 
     private fun measureOrdinaryGroups(source: ViewGroup, snapshot: Bitmap) {
-        val groupId = source.resources.getIdentifier("ll_normal", "id", source.context.packageName)
+        val graph = binding(source) ?: return
         ordinaryGroupCenters.fill(Float.NaN)
-        if (groupId == 0) return
-        for (index in intArrayOf(0, 1, 3, 4)) {
-            val group = source.getChildAt(index).findViewById<View>(groupId) ?: continue
+        for ((index, cell) in graph.slots.withIndex()) {
+            if (cell.role == Role.PROMOTION) continue
+            val group = cell.normal
             if (group.visibility != View.VISIBLE || group.height <= 0) continue
             val area = Rect(0, 0, group.width, group.height)
             source.offsetDescendantRectToMyCoords(group, area)
@@ -142,36 +217,51 @@ internal class MeituanTakeoutNavigationState : AppNavigationState {
         enabled: Boolean, density: Float, barHeightPx: Int, surfaceColor: () -> Int,
     ) {
         val index = selected()
-        val onProfile = enabled && index == 4
+        val graph = binding(source)
+        val onProfile = enabled && graph?.slots?.getOrNull(index)?.role == Role.PROFILE
         if (onProfile != wasOnProfile) {
             (host as? GlassHostLayout)?.onAdapterScrollHideTimerChanged(false, 0L)
             wasOnProfile = onProfile
         }
-        orderViewport.update(source, enabled && index == 3)
-        profileSafety.update(host, onProfile)
+        if (!enabled) {
+            MeituanTakeoutOwnership.restoreWhenDisabled()
+            chrome.release(); orderViewport.release(); profileSafety.release(); ownsVisuals = false
+            return
+        }
+        if (graph == null) { chrome.maintain(); return }
+        chrome.update(graph)
+        val page = if (graph.slots.getOrNull(index)?.role in setOf(Role.ORDERS, Role.PROFILE)) graph.page(index) else null
+        orderViewport.update(graph, page, graph.slots.getOrNull(index)?.role == Role.ORDERS)
+        profileSafety.update(host, page?.profileScroll, onProfile)
     }
 
     override fun hostPageAllowsNavigation(host: GlassHostLayout, root: View?): Boolean? {
-        val index = host.adapterResolvedSelection() ?: host.adapterSelectedIndex
-        return if (index == 4) true else null
+        if (!host.config.enabled) return false
+        val graph = binding(host.adapterNavigationSource) ?: return ownsVisuals
+        return if (graph.slots.getOrNull(graph.selected() ?: -1)?.role == Role.PROFILE) true else null
     }
+    override fun forceNavigationBarImmersed(host: GlassHostLayout): Boolean? =
+        if (!host.config.enabled) false else null
 
     override fun dispose() {
-        orderViewport.restore()
-        profileSafety.restore()
+        val disabled = pageHost?.config?.enabled == false
+        if (disabled) MeituanTakeoutOwnership.restoreWhenDisabled()
+        chrome.release(); nativeBinding?.release(); nativeBinding = null; snapshotBinding = null
+        orderViewport.release(); profileSafety.release()
     }
+    override fun onHostDetached() = dispose()
 
     override fun transformNavigationSnapshot(
         source: ViewGroup, snapshot: Bitmap, slotCount: Int,
     ): Bitmap? {
         // Only replace the known five-tab promotion slot. Other native layouts
         // and unloaded/hidden promotion artwork retain their original snapshot.
-        if (slotCount != 5 || source.childCount != 5) return null
-        val slot = source.getChildAt(2) as? ViewGroup ?: return null
-        val id = source.resources.getIdentifier("iv_promotion", "id", source.context.packageName)
-        if (id == 0) return null
-        val promotion = slot.findViewById<ImageView>(id) ?: return null
-        if (promotion.visibility != View.VISIBLE || promotion.drawable == null ||
+        val graph = binding(source) ?: return null
+        promotionArtworkReady = false
+        val index = graph.index(Role.PROMOTION)
+        val cell = graph.slots.getOrNull(index) ?: return null
+        val promotion = cell.promotion ?: return null
+        if (!cell.activePromotion || promotion.drawable == null ||
             promotion.width <= 0 || promotion.height <= 0) return null
 
         val artwork = Bitmap.createBitmap(promotion.width, promotion.height, Bitmap.Config.ARGB_8888)
@@ -180,8 +270,8 @@ internal class MeituanTakeoutNavigationState : AppNavigationState {
             // the enclosing CardView background belongs to the activity artwork.
             promotion.draw(Canvas(artwork))
             val bounds = visibleBounds(artwork) ?: return null
-            val slotLeft = 2 * snapshot.width / slotCount
-            val slotRight = 3 * snapshot.width / slotCount
+            val slotLeft = index * snapshot.width / slotCount
+            val slotRight = (index + 1) * snapshot.width / slotCount
             val canvas = Canvas(snapshot)
             val save = canvas.save()
             try {
@@ -192,6 +282,7 @@ internal class MeituanTakeoutNavigationState : AppNavigationState {
                 canvas.drawBitmap(artwork,
                     (slotLeft + slotRight) / 2f - bounds.exactCenterX(),
                     snapshot.height / 2f - bounds.exactCenterY(), null)
+                promotionArtworkReady = true
             } finally {
                 canvas.restoreToCount(save)
             }
@@ -200,4 +291,5 @@ internal class MeituanTakeoutNavigationState : AppNavigationState {
         }
         return snapshot
     }
+
 }

@@ -4,7 +4,7 @@ import android.graphics.Rect
 import android.view.View
 import android.view.ViewGroup
 import android.os.SystemClock
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XposedBridge
 
 /** Per-host target finder for WeChat native navigation colour repairs. */
 internal class WeChatContentTargetProbe {

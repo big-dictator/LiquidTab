@@ -6,8 +6,8 @@ import android.view.ViewGroup
 import android.view.MotionEvent
 import android.widget.ImageView
 import android.widget.TextView
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.offlineglass.hook.compat.XposedHelpers
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 import io.github.offlineglass.hook.NavigationCandidate
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
 import io.github.offlineglass.hook.adapters.AppNavigationState

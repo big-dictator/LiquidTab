@@ -6,7 +6,7 @@ import io.github.offlineglass.targets.TargetSpec
 
 
 internal val targetSpec: TargetSpec = TargetSpec("taobao", "com.taobao.taobao", "淘宝", AdapterSource.DEDICATED,
-            activityHints = setOf("com.taobao.tao.welcome.Welcome"),
+            activityHints = setOf("com.taobao.tao.welcome.Welcome", "com.taobao.tao.TBMainActivity"),
             idHints = setOf("tabs"),
             classHints = setOf("android.widget.TabWidget", "Welcome"),
             textHints = setOf("首页", "视频", "消息", "购物车", "我的淘宝"),

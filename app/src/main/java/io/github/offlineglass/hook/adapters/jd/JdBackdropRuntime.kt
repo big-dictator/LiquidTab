@@ -2,7 +2,7 @@ package io.github.offlineglass.hook.adapters.jd
 
 import android.graphics.RenderNode
 
-/** JD's H5/native feed must use one compositor readback, never a second live scene. */
+/** JD's custom feeds use a composed strip, avoiding a second WebView draw. */
 internal object JdBackdropRuntime {
     inline fun activateCompositor(
         liveNode: RenderNode,

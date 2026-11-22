@@ -45,14 +45,13 @@ internal class JdLayoutProbe(
             val liveRoot = host.rootView as? ViewGroup ?: return@OnGlobalLayoutListener
             if (liveRoot.width <= 0 || liveRoot.height <= 0) return@OnGlobalLayoutListener
             refreshNewProducts(liveRoot, now)
-            val bar = checkout.bar?.get()
-            if (bar != null && bar.isAttachedToWindow && bar.parent != null) {
-                checkout.correct(host.rootView as? ViewGroup, host)
+            if (selectedIndex() == 3) {
+                checkout.onCartLayout(liveRoot, host)
                 return@OnGlobalLayoutListener
             }
+            checkout.syncPageVisibility(-1)
             if (now - lastLayoutDetect < 80L) return@OnGlobalLayoutListener
-            if ((checkout.discoveryExhausted || now < checkout.nextFindAt) &&
-                now < flash.nextFindAt) return@OnGlobalLayoutListener
+            if (now < flash.nextFindAt) return@OnGlobalLayoutListener
             lastLayoutDetect = now
             if (selectedIndex() == 0 && !newProductsActive() && now >= flash.nextFindAt &&
                 (!flashBannerLive || !flashCartLive)
@@ -64,16 +63,6 @@ internal class JdLayoutProbe(
                 if (foundBanner != null || foundCart != null) flash.correct(host.rootView as? ViewGroup, host)
             } else if (selectedIndex() != 0) {
                 flash.nextFindAt = now + FLASH_INACTIVE_BACKOFF_MS
-            }
-            if (checkout.discoveryExhausted || now < checkout.nextFindAt) return@OnGlobalLayoutListener
-            val found = finder.findCheckoutBar(liveRoot, liveRoot.width, liveRoot.height)
-            if (found != null) {
-                checkout.bar = WeakReference(found)
-                checkout.nextFindAt = 0L
-                checkout.correct(host.rootView as? ViewGroup, host)
-            } else {
-                checkout.discoveryExhausted = true
-                checkout.nextFindAt = Long.MAX_VALUE
             }
         }
         layoutListener = listener

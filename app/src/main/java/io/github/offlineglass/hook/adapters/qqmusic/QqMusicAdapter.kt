@@ -4,10 +4,10 @@ import android.app.Activity
 import android.content.Context
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 import io.github.offlineglass.hook.HookConfigReader
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.NavigationCandidate
@@ -19,6 +19,7 @@ import io.github.offlineglass.targets.TargetSpec
 /** QQMusic owns navigation discovery, artwork, player layout and native chrome. */
 internal object QqMusicAdapter : TargetAdapter {
     override val key = "qqmusic"
+    override fun surfaceOpacityScale(config: GlassConfig) = config.spotifyBarOpacity
     override val ownsNavigationFinding = true
     override val ownsNavigationDrawing = true
     override val skipNavigationSnapshot = true
@@ -29,6 +30,10 @@ internal object QqMusicAdapter : TargetAdapter {
     override val hasPerFrameScene = true
     override val suppressPlatformElevation = true
     override val foregroundNavigationOverSelection = true
+    // Native selected artwork supplies its own colour. Do not apply the shared
+    // SRC_IN accent filter when recording icons into the refracting indicator.
+    override val drawsNavigationInOptics = true
+    override val skipBackdropStableDelay = true
     override val usesContentDarkMode = true
     override val liveBackdropFramePump = true
     override val requestedFrameRateMax = 120f
@@ -106,13 +111,12 @@ internal object QqMusicAdapter : TargetAdapter {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val stack = param.thisObject as? ViewGroup ?: return
                     val page = param.args.getOrNull(0) as? View ?: return
-                    val pageName = AdapterNavigationSearch.resourceEntryName(page)
                     // Native shouldMarginForMiniBar is true only for a minibar Activity
-                    // and a page tagged lc1=true. Use that contract for every secondary
-                    // page, including pages whose root has no resource ID.
+                    // and a page opted into minibar layout. Use that contract for every
+                    // secondary page, including pages whose root has no resource ID.
                     val minibarPage = param.args.getOrNull(2) == true
-                    val mainPage = pageName == "g61" &&
-                        AdapterNavigationSearch.resourceEntryName(stack) == "g65"
+                    // Structure contract: the main desk page carries the main pager.
+                    val mainPage = QqMusicBinding.isMainPage(page)
                     if (!minibarPage && !mainPage) return
                     if (!HookConfigReader.read(stack.context, spec.packageName).enabled) return
                     val height = param.args.getOrNull(1) as? Int ?: return

@@ -1,30 +1,40 @@
 package io.github.offlineglass.hook.adapters.jd
 
-import android.os.SystemClock
-import android.view.MotionEvent
-import android.view.View
 import android.view.ViewGroup
+import io.github.offlineglass.hook.GlassHostLayout
 
-/** Send a complete gesture through NavigationGroup so JD handles reselect and icon animation. */
-internal object JdTabTouch {
-    fun dispatch(item: View, source: ViewGroup?): Boolean {
-        if (!item.isAttachedToWindow || !item.isEnabled || item.width <= 0 || item.height <= 0) return false
-        val row = source?.takeIf { it.isAttachedToWindow && it.width > 0 && it.height > 0 }
-        val now = SystemClock.uptimeMillis()
-        val itemLocation = IntArray(2).also(item::getLocationInWindow)
-        val sourceLocation = IntArray(2).also { row?.getLocationInWindow(it) }
-        val x = if (row != null) itemLocation[0] - sourceLocation[0] + item.width / 2f else item.width / 2f
-        val y = if (row != null) itemLocation[1] - sourceLocation[1] + item.height / 2f else item.height / 2f
-        val down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0)
-        val up = MotionEvent.obtain(now, now + 48L, MotionEvent.ACTION_UP, x, y, 0)
-        return try {
-            val target = row ?: item
-            val acceptedDown = target.dispatchTouchEvent(down)
-            val acceptedUp = target.dispatchTouchEvent(up)
-            acceptedDown || acceptedUp
+/** Dispatch JD's original tab action directly from the user's selection. */
+internal class JdTabTouch(private val host: GlassHostLayout, private val preview: JdPagePreview) {
+    var pendingTarget = -1
+        private set
+    fun selected(source: ViewGroup?, count: Int): Int? {
+        return JdNavigationBinding.resolve(source)?.takeIf { it.slots.size == count }?.selected()
+    }
+
+    fun dispatch(source: ViewGroup?, index: Int, count: Int): Boolean {
+        val row = JdNavigationBinding.resolve(source)?.takeIf { it.slots.size == count } ?: return false
+        if (index == JdNavigationBinding.BROWSE) return false
+        val touch = row.slots.getOrNull(index)?.touch ?: return false
+        if (!touch.isAttachedToWindow || !touch.isShown || touch.windowToken !== host.windowToken ||
+            !touch.isEnabled || !host.hasWindowFocus()) return false
+        cancel()
+        pendingTarget = index
+        android.os.Trace.beginSection("LiquidTab.JD.nativeTabClick")
+        var accepted = false
+        try {
+            JdNativePageTransitions.click(host) {
+                JdNavigationClickGate.click { accepted = touch.performClick() }
+            }
         } finally {
-            down.recycle()
-            up.recycle()
+            pendingTarget = -1
+            android.os.Trace.endSection()
         }
+        // Never retry a business click or mark a native cooldown rejection visited.
+        return accepted && selected(source, count) == index
+    }
+    fun cancel() {
+        pendingTarget = -1
+        if (preview.target >= 0) preview.finish()
+        preview.nativeWillDispatch()
     }
 }

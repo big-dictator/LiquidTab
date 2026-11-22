@@ -1,147 +1,221 @@
 package io.github.offlineglass.hook.adapters.meituan_main
 
 import android.graphics.Canvas
-import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
-import android.widget.TextView
-import android.widget.ImageView
-import android.widget.ScrollView
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.AppNavigationState
-import java.util.WeakHashMap
+import io.github.offlineglass.hook.adapters.meituan_main.MeituanMainTabContract.SLOT_COUNT
+import io.github.offlineglass.hook.adapters.meituan_main.MeituanMainTabContract.VIDEO
 
 /** Cart geometry and native tab artwork belong exclusively to Meituan main. */
-internal class MeituanMainNavigationState : AppNavigationState {
-    private val lifted = WeakHashMap<View, Float>()
-    private var nextScan = 0L
-    private var cachedFooter: View? = null
-    private var cachedTargets = emptyList<View>()
-    private val position = IntArray(2)
+internal class MeituanMainNavigationState(private val pageHost: GlassHostLayout? = null) : AppNavigationState {
+    private val binding = MeituanMainBinding()
+    private val checkout = MeituanMainCheckoutController(binding)
+    private val sceneSelector = MeituanMainSceneSelector(binding)
+    private val profileSafety = MeituanMainProfileSafety(binding)
+    private val profileWindow = MeituanMainProfileWindow()
 
-    private fun walk(root: View, visit: (View) -> Unit) {
-        if (root is GlassHostLayout || root.visibility != View.VISIBLE) return
-        visit(root)
-        if (root is ViewGroup) for (i in 0 until root.childCount) walk(root.getChildAt(i), visit)
+    private var nativeScene: View? = null
+
+    private var contentMotionUntil = 0L
+    private var scrollObserver: android.view.ViewTreeObserver? = null
+    private val scrollListener = android.view.ViewTreeObserver.OnScrollChangedListener { onContentScroll() }
+    private val backdropState = MeituanMainBackdropState()
+    private var lastScene: View? = null
+    private var lastSceneRevision = -1
+    private var sceneGeometry = ""
+    private val scenePosition = IntArray(2)
+    private val hostPosition = IntArray(2)
+    private var sceneDx = Int.MIN_VALUE
+    private var sceneDy = Int.MIN_VALUE
+
+    override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int? =
+        nativeSelected(source, slotCount)
+
+    private fun nativeSelected(source: ViewGroup?, slotCount: Int): Int? {
+        if (slotCount != SLOT_COUNT) return null
+        val native = MeituanMainNativeTabs.bind(source) ?: return null
+        return native.cells.singleOrNull { it.glyph.isSelected }?.role
     }
 
-    private fun restore() {
-        lifted.forEach { (view, translation) -> view.translationY = translation }
-        lifted.clear()
-        cachedFooter = null
-        cachedTargets = emptyList()
+    override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean =
+        dispatchLive(source, index, slotCount)
+
+    private fun dispatchLive(source: ViewGroup?, index: Int, count: Int): Boolean {
+        if (count != SLOT_COUNT || index !in 0 until count || index == VIDEO) return false
+        val button = MeituanMainNativeTabs.bind(source)?.cells?.firstOrNull { it.role == index }?.button
+            ?.takeIf { it.isAttachedToWindow && it.isEnabled } ?: return false
+
+        val handled = button.performClick()
+        sceneSelector.onFocusChanged(true)
+
+        return handled
     }
 
-    override fun onNavigationTabSwitched(index: Int, slotCount: Int, now: Long) {
-        restore()
-        nextScan = 0L
+    override fun resolveBackdropScene(host: View): View? = nativeScene ?: sceneSelector.samplingRoot
+    override fun skipLiveBackdrop(selectedIndex: Int): Boolean = nativeScene == null
+    override fun needsFreshSoftwareBackdrop(): Boolean =
+        nativeScene == null && sceneSelector.samplingRoot?.let {
+            it.isAttachedToWindow && backdropState.needsSample(it.isDirty)
+        } == true
+    override fun onSoftwareBackdropRecorded() = backdropState.recorded()
+    override fun onLiveBackdropRecorded(selectedIndex: Int) = backdropState.recorded()
+    override fun backdropSceneViews(content: ViewGroup, hostIndex: Int): List<View>? =
+        (nativeScene)?.let { listOf(it) }
+
+    override fun onHostFrame(host: View) {
+        val glass = host as? GlassHostLayout ?: return
+        val committed = nativeSelected(glass.adapterNavigationSource, glass.adapterSlotCount)
+        if (committed != null && backdropState.select(committed)) {
+            glass.invalidateOpticalSceneForAdapter()
+            glass.invalidateOpticalBackdropForAdapter()
+        }
+        val index = committed ?: glass.navigationIndex
+        nativeScene = sceneSelector.pick(glass, index, unsafeChannel = false)
+
+        if (scrollObserver == null) scrollObserver = glass.rootView.viewTreeObserver.also {
+            it.addOnScrollChangedListener(scrollListener)
+        }
+        val scene = nativeScene
+        scene?.getLocationInWindow(scenePosition)
+        glass.getLocationInWindow(hostPosition)
+        val dx = scenePosition[0] - hostPosition[0]
+        val dy = scenePosition[1] - hostPosition[1]
+        if (sceneDx == Int.MIN_VALUE || kotlin.math.abs(dx - sceneDx) > 1) sceneDx = dx
+        if (sceneDy == Int.MIN_VALUE || kotlin.math.abs(dy - sceneDy) > 1) sceneDy = dy
+        val geometry = "${glass.width}:${glass.height}:${scene?.width}:${scene?.height}:$sceneDx:$sceneDy"
+        if (scene !== lastScene || lastSceneRevision != index || geometry != sceneGeometry) {
+            lastScene = scene; lastSceneRevision = index; sceneGeometry = geometry
+            glass.invalidateOpticalSceneForAdapter()
+        }
+
+    }
+
+    override fun onContentScroll() {
+        contentMotionUntil = android.os.SystemClock.uptimeMillis()
+        pageHost?.postInvalidateOnAnimation()
+    }
+
+    override fun onHostWindowFocusChanged(hasFocus: Boolean) {
+        sceneSelector.onFocusChanged(hasFocus)
+
+    }
+
+    override fun onHostDetached() {
+        backdropState.reset()
+        profileWindow.restore()
+        profileSafety.restore()
+        scrollObserver?.takeIf { it.isAlive }?.removeOnScrollChangedListener(scrollListener)
+        scrollObserver = null
+        sceneSelector.detach(); nativeScene = null
+        MeituanMainNativeTabs.release(takeoverRow); takeoverRow = null
+        checkout.release(); binding.release()
+    }
+
+
+    override fun suppressNativeChromeEarly(source: ViewGroup?) {
+        val host = pageHost ?: return
+        if (!tabs.ready) return
+        checkout.update(host, host.adapterSelectedIndex, false,
+            null)
     }
 
     override fun adjustFloatingActions(host: View, source: ViewGroup?) {
-        source ?: return
-        // Native selected state remains available even when the source is transparent.
-        if (currentSelection != 3) { restore(); return }
-        val now = SystemClock.uptimeMillis()
-        host.getLocationInWindow(position)
-        val barTop = position[1].toFloat()
-        val density = host.resources.displayMetrics.density
-        if (now >= nextScan || cachedFooter?.isAttachedToWindow != true || cachedFooter?.isShown != true) {
-        nextScan = now + 250L
-        val targets = linkedSetOf<View>()
-        walk(host.rootView) { view ->
-            if (view is TextView && view.text.toString().startsWith("结算")) {
-                var ancestor = view.parent as? View
-                var footer: View? = null
-                while (ancestor != null && ancestor !== host.rootView) {
-                    if (ancestor.width >= host.rootView.width * .8f &&
-                        ancestor.height in 1..(100 * density).toInt()) footer = ancestor
-                    if (ancestor.height > 100 * density) break
-                    ancestor = ancestor.parent as? View
-                }
-                footer?.let(targets::add)
-            }
-            val description = view.contentDescription?.toString().orEmpty()
-            val id = runCatching { view.resources.getResourceEntryName(view.id) }.getOrDefault("")
-            if (description.contains("回到顶部") || description.contains("返回顶部") || description == "置顶" ||
-                id.contains("back_top") || id.contains("back_to_top")) {
-                targets += view
-            }
-        }
-        // MSC's floating return control can be an unlabelled image. Limit the
-        // geometry fallback to the cart root's non-scrolling overlay branch.
-        val footer = targets.firstOrNull { it.width >= host.rootView.width * .8f }
-        val page = footer?.parent as? ViewGroup
-        if (page != null) walk(page) { view ->
-            if (view !is ViewGroup || view.width !in 1..(80 * density).toInt() ||
-                view.height !in 1..(80 * density).toInt()) return@walk
-            var ancestor = view.parent as? View
-            var excluded = false
-            while (ancestor != null && ancestor !== page) {
-                if (ancestor === footer || ancestor is ScrollView ||
-                    ancestor.javaClass.name.contains("Scroll") || ancestor.javaClass.name.contains("Recycler")) excluded = true
-                ancestor = ancestor.parent as? View
-            }
-            if (excluded) return@walk
-            view.getLocationInWindow(position)
-            if (position[0] < host.rootView.width * .7f || position[1] < host.rootView.height * .65f) return@walk
-            var image = false
-            walk(view) { if (it is ImageView) image = true }
-            if (image) targets += view
-        }
-        cachedFooter = footer
-        cachedTargets = targets.filter { candidate ->
-            var parent = candidate.parent as? View
-            var nested = false
-            while (parent != null) {
-                if (parent in targets) nested = true
-                parent = parent.parent as? View
-            }
-            !nested
-        }
-        lifted.keys.toList().filter { it !in cachedTargets }.forEach { view ->
-            lifted.remove(view)?.let { view.translationY = it }
-        }
-        }
-        val lift = cachedFooter?.let { view ->
-            val baseline = lifted[view] ?: view.translationY
-            view.getLocationInWindow(position)
-            val bottom = position[1] + view.height - (view.translationY - baseline)
-            (bottom - barTop + 4 * density).coerceAtLeast(0f)
-        } ?: 0f
-        // Enforce the cached geometry on every pre-draw, including frames in
-        // which MSC resets translation while updating selection or detail controls.
-        for (view in cachedTargets) {
-            val baseline = lifted.getOrPut(view) { view.translationY }
-            view.translationY = baseline - lift
-        }
+        val glass = host as? GlassHostLayout ?: return
+        if (!tabs.ready) return
+        checkout.update(glass, glass.adapterSelectedIndex, false,
+            null)
     }
 
-    private val tabs = MeituanMainTabsRenderer()
+    private val tabs = MeituanMainStateArtwork()
+    private var takeoverRow: ViewGroup? = null
+    override val readyForDrawing: Boolean get() = tabs.ready
+    override fun drawsNavigationContent(): Boolean = tabs.ready
+    override fun allowsHostTouch(): Boolean = tabs.ready
+    override fun beforeHostDraw(host: View, source: ViewGroup?): Boolean = tabs.ready
+    override fun hostChromeAlpha(host: View, selectedIndex: Int): Float = if (tabs.ready) 1f else 0f
+    override fun suppressRedrawnSource(): Boolean = true
+    private fun prepareTakeover(source: ViewGroup?): Boolean {
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) return false
+        // Feed relayout is not a user disable. Keep ownership and the last
+        // verified artwork while waiting for a replacement source.
+        if (source == null || MeituanMainNativeTabs.bind(source) == null) return false
+        takeoverRow = source
+        MeituanMainNativeTabs.activate(source, true)
+        return tabs.prepare(source)
+    }
     override fun prepare(source: ViewGroup?, schedule: (Long, () -> Unit) -> Unit) {
-        source ?: return
-        tabs.prepareFirstFrame(source)
+        prepareTakeover(source)
     }
-    override fun onNavigationSnapshotReady(snapshot: android.graphics.Bitmap, slotCount: Int) {
-        tabs.accept(snapshot, slotCount)
+
+    override fun draw(canvas: Canvas, frame: io.github.offlineglass.hook.adapters.AdapterNavigationFrame) {
+        tabs.draw(canvas, frame, active = frame.hideSelectedForOptics)
     }
-    override fun drawFixedNavigationSlot(canvas: Canvas, index: Int, selectedIndex: Int,
-        dark: Boolean, centerX: Float, centerY: Float, boxSize: Float): Boolean {
-        val source = drawingSource ?: return false
-        val host = drawingHost ?: return false
-        val interactionScale = boxSize / minOf(source.width / source.childCount.toFloat(), source.height.toFloat())
-        return tabs.draw(canvas, index, centerX, host.height / 2f, interactionScale)
+
+    override fun drawForeground(canvas: Canvas, frame: io.github.offlineglass.hook.adapters.AdapterNavigationFrame,
+        selectionPath: android.graphics.Path, drawSource: () -> Unit): Boolean {
+        val artworkFrame = frame.copy(extraScale = frame.extraScale *
+            (frame.height / (64f * frame.density)).coerceIn(.875f, 1f))
+        if (selectionPath.isEmpty) { tabs.draw(canvas, artworkFrame, active = false); return true }
+        val outside = canvas.save()
+        canvas.clipOutPath(selectionPath)
+        // Foreground state depends on the lens geometry, never on the delayed
+        // native page selection or the optical-source capture flag.
+        tabs.draw(canvas, artworkFrame, active = false)
+        canvas.restoreToCount(outside)
+        val plain = 1f - frame.navigationOpticalMix.coerceIn(0f, 1f)
+        if (plain > 0f) {
+            val inside = canvas.save()
+            canvas.clipPath(selectionPath)
+            canvas.saveLayerAlpha(0f, 0f, frame.width.toFloat(), frame.height.toFloat(), (plain * 255).toInt())
+            tabs.draw(canvas, artworkFrame, active = true)
+            canvas.restoreToCount(inside)
+        }
+        return true
     }
-    private var drawingSource: ViewGroup? = null
-    private var drawingHost: View? = null
+
+    override fun includeNavigationInIndicatorScene(surfaceActive: Boolean) = true
     private var currentSelection = -1
-    private var loggedSource: ViewGroup? = null
     override fun onHostPreDraw(host: View, source: ViewGroup?, selected: () -> Int,
         enabled: Boolean, density: Float, barHeightPx: Int, surfaceColor: () -> Int) {
-        drawingSource = source
-        drawingHost = host
+        if (!enabled) {
+            (source ?: takeoverRow)?.let {
+                MeituanMainNativeTabs.release(it, restoreNative = true)
+                it.alpha = 1f
+            }
+            takeoverRow = null; tabs.clear()
+            return
+        }
         currentSelection = selected()
+        val changed = prepareTakeover(source)
+        profileSafety.update(host, enabled && tabs.ready && currentSelection == 4)
+        if (changed) (host as? GlassHostLayout)?.invalidateProjectionCache()
     }
-    override fun dispose() { restore(); tabs.clear(); drawingSource = null; drawingHost = null }
+    override fun forceNavigationBarImmersed(host: GlassHostLayout): Boolean? {
+        // Window fitting belongs to the committed native page, not the pending
+        // preview target: never resize the window in the middle of the spring.
+        val committed = nativeSelected(host.adapterNavigationSource, host.adapterSlotCount)
+            ?: host.adapterSelectedIndex
+        val profile = host.config.enabled && tabs.ready &&
+            committed == 4
+        profileWindow.update(host, profile)
+        return if (profile) true else null
+    }
+
+    override fun dispose() {
+        profileWindow.restore()
+        profileSafety.restore()
+        scrollObserver?.takeIf { it.isAlive }?.removeOnScrollChangedListener(scrollListener)
+        scrollObserver = null
+        sceneSelector.detach(); nativeScene = null
+        checkout.release(); tabs.clear(); binding.release()
+        MeituanMainNativeTabs.release(pageHost?.adapterNavigationSource,
+            restoreNative = pageHost?.config?.enabled == false)
+    }
+
 }
+
+
 
 

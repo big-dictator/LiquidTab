@@ -23,6 +23,8 @@ captures/
 /handoff/
 *.apk
 *.aab
+# Optional personal workspace. Public builds do not include it.
+/network/
 *.idsig
 mapping.txt
 *.hprof
@@ -30,3 +32,5 @@ hs_err_pid*.log
 .codex-*
 .*.png
 .*.xml
+# Local reverse-engineering archives; never publish extracted apps or private artifacts.
+/trash/

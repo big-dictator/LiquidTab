@@ -9,9 +9,11 @@ import android.view.View
 import android.os.SystemClock
 import kotlin.math.abs
 import kotlin.math.roundToInt
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.GlassHostLayout
+import io.github.offlineglass.hook.adapters.AdapterOwnedOverlay
 
 /** Xiaohongshu's five fixed slots; middle publish action is drawn, not a page label. */
 internal class XhsNavigationState : AppNavigationState {
@@ -22,11 +24,15 @@ internal class XhsNavigationState : AppNavigationState {
     private val hostPosition = IntArray(2)
     private val listPosition = IntArray(2)
     private val messageViewport = XhsMessageViewport()
+    private val homeViewport = XhsHomeViewport()
+    private val bottomGradient = XhsBottomGradient()
 
     override fun onHostPreDraw(
         host: View, source: ViewGroup?, selected: () -> Int, enabled: Boolean,
         density: Float, barHeightPx: Int, surfaceColor: () -> Int,
     ) {
+        bottomGradient.update(host, enabled)
+        if (enabled) homeViewport.update(host.rootView) else homeViewport.restore()
         if (!enabled || selected() != 3) {
             messageViewport.restore()
             restoreListPadding()
@@ -40,7 +46,7 @@ internal class XhsNavigationState : AppNavigationState {
             (host.rootView as? ViewGroup)?.let { stack.add(it) }
             while (stack.isNotEmpty()) {
                 val view = stack.removeLast()
-                if (view === host || view === source || !view.isShown) continue
+                if (view === host || view === source || view is GlassHostLayout || view is AdapterOwnedOverlay || !view.isShown) continue
                 messageViewport.discover(view)
                 if (view is ViewGroup && isRecyclerList(view) && view.height > barHeightPx * 2 && view.width > host.width / 2) {
                     messageLists.getOrPut(view) { ListPadding(view.paddingBottom, view.clipToPadding, view.paddingBottom) }
@@ -78,33 +84,92 @@ internal class XhsNavigationState : AppNavigationState {
     }
 
     private fun isRecyclerList(view: View): Boolean {
-        var type: Class<*>? = view.javaClass
-        while (type != null) {
-            if (type.name == "androidx.recyclerview.widget.RecyclerView" ||
-                type.name == "android.support.v7.widget.RecyclerView") return true
-            type = type.superclass
-        }
-        return false
+        return XhsTopBinding.isRecycler(view)
     }
 
     override fun dispose() {
+        bottomGradient.clear()
+        homeViewport.restore()
         messageViewport.restore()
         restoreListPadding()
         for ((view, base) in xhsFloatingActionBaseTranslations) view.translationY = base
         xhsFloatingActionBaseTranslations.clear()
     }
     private val xhsFloatingActionBaseTranslations = java.util.WeakHashMap<View, Float>()
-    private val xhsLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        textAlign = Paint.Align.CENTER
-        typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
+    private val actionHostPosition = IntArray(2)
+    private val actionPosition = IntArray(2)
+    private val renderer = XhsNavigationRenderer()
+    private var diagnosticTapGeneration = 0
+
+    private fun pagerIndex(view: View): Int? =
+        runCatching { view.javaClass.getMethod("getCurrentItem").invoke(view) as? Int }.getOrNull()
+
+    private fun pagerCount(view: View): Int? = runCatching {
+        val adapter = view.javaClass.getMethod("getAdapter").invoke(view) ?: return null
+        adapter.javaClass.getMethod("getCount").invoke(adapter) as? Int
+    }.getOrNull()
+
+    private fun diagnosticPager(host: View): View? {
+        val queue = ArrayDeque<View>()
+        queue.add(host.rootView)
+        var result: View? = null
+        repeat(600) {
+            val view = queue.removeFirstOrNull() ?: return result
+            if (view is ViewGroup && view.javaClass.name == SCROLLABLE_PAGER_CLASS &&
+                view.isShown && (pagerCount(view) ?: -1) in 4..5 && pagerIndex(view) != null) {
+                if (result != null) return null
+                result = view
+            }
+            if (view is ViewGroup) for (i in 0 until view.childCount) queue.add(view.getChildAt(i))
+        }
+        return null
     }
-    private val bilibiliIconPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    private fun observePagerCommit(pager: View, index: Int, previous: Int) {
+        val target = if (pagerCount(pager) == 4 && index > 2) index - 1 else index
+        if (target == previous || !pager.isHardwareAccelerated) return
+        val generation = ++diagnosticTapGeneration
+        val observer = pager.viewTreeObserver
+        if (!observer.isAlive) return
+        val listener = object : android.view.ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                if (generation != diagnosticTapGeneration || pagerIndex(pager) == target) {
+                    if (observer.isAlive) observer.removeOnPreDrawListener(this)
+                    if (generation == diagnosticTapGeneration && pager.isShown && observer.isAlive) {
+                        observer.registerFrameCommitCallback {
+                            if (generation == diagnosticTapGeneration && pagerIndex(pager) == target &&
+                                pager.isShown && android.os.Trace.isEnabled()) {
+                                android.os.Trace.beginSection("LiquidTab.Xhs.PagerCommitCandidate.$index")
+                                android.os.Trace.endSection()
+                            }
+                        }
+                    }
+                }
+                return true
+            }
+        }
+        observer.addOnPreDrawListener(listener)
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            if (observer.isAlive) observer.removeOnPreDrawListener(listener)
+        }, 1800L)
+    }
     override fun performTap(host: View, source: ViewGroup?, index: Int, slotCount: Int): Boolean {
         val tabBar = findTabBar(host, source) ?: return false
         val getter = TAB_GETTERS.getOrNull(index)?.takeIf { it.isNotEmpty() } ?: return false
         val target = runCatching { XposedHelpers.callMethod(tabBar, getter) as? View }.getOrNull()
             ?: return false
-        return performClickThroughTab(target, tabBar)
+        val pager = if (index != 2 && io.github.offlineglass.BuildConfig.DEBUG && android.os.Trace.isEnabled())
+            diagnosticPager(host) else null
+        val before = pager?.let(::pagerIndex)
+        val clicked = performClickThroughTab(target, tabBar)
+        if (clicked && pager != null && before != null) observePagerCommit(pager, index, before)
+        if (clicked && index == 2) {
+            // Publish opens a native action, not a page. This callback's true
+            // result commits the page index in the host; keep the existing page.
+            host.postInvalidateOnAnimation()
+            return false
+        }
+        return clicked
     }
     override fun onTapSucceeded(requestRefresh: (Long) -> Unit) {
         requestRefresh(0L)
@@ -150,113 +215,52 @@ internal class XhsNavigationState : AppNavigationState {
         if (source.alpha != 0f) source.alpha = 0f
         if (source.background != null) source.background = null
         val parent = source.parent as? ViewGroup ?: return
-        removeNativeTabInset(parent)
         val location = IntArray(2).also(parent::getLocationInWindow)
         val rootHeight = source.rootView.height.coerceAtLeast(1)
         val isBottomShell = parent.height in 1..(source.height * 2).coerceAtLeast(1) &&
             location[1] + parent.height >= rootHeight * 0.78f
         if (isBottomShell && parent.background != null) parent.background = null
     }
-    private fun removeNativeTabInset(tabBarParent: ViewGroup) {
-        val indexRoot = tabBarParent.parent as? ViewGroup ?: return
-        for (index in 0 until indexRoot.childCount) {
-            val content = indexRoot.getChildAt(index) as? ViewGroup ?: continue
-            if (!content.javaClass.name.endsWith(".ContentView")) continue
-            for (childIndex in 0 until content.childCount) {
-                val pager = content.getChildAt(childIndex)
-                if (pager.javaClass.name != SCROLLABLE_PAGER_CLASS) continue
-                val params = pager.layoutParams as? ViewGroup.MarginLayoutParams ?: continue
-                if (params.bottomMargin != 0) {
-                    params.bottomMargin = 0
-                    pager.layoutParams = params
-                    pager.requestLayout()
-                    content.requestLayout()
-                }
-                return
-            }
+    override fun includeNavigationInIndicatorScene(surfaceActive: Boolean) = true
+
+    override fun drawForeground(canvas: Canvas, frame: AdapterNavigationFrame,
+        selectionPath: android.graphics.Path, drawSource: () -> Unit): Boolean {
+        if (frame.detachedDirectSelection && !selectionPath.isEmpty) {
+            val outside = canvas.save()
+            try {
+                canvas.clipOutPath(selectionPath)
+                drawSource()
+            } finally { canvas.restoreToCount(outside) }
+            val inside = canvas.save()
+            try {
+                canvas.clipPath(selectionPath)
+                renderer.draw(canvas, frame.copy(
+                    extraScale = (frame.height / (64f * frame.density)).coerceIn(0.875f, 1f),
+                    hideSelectedForOptics = true,
+                ))
+            } finally { canvas.restoreToCount(inside) }
+            return true
         }
-    }
-    override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = with(frame) {
-
-        if (slotCount != 5 || width <= 0 || height <= 0) return
-
-        val slotWidth = slotWidth
-
-        val horizontalPadding = 4f * density
-
-        val dark = darkGlass
-
-        val unselectedColor = if (dark) Color.rgb(232, 230, 235) else Color.rgb(40, 40, 40)
-
-        xhsLabelPaint.textSize = 15f * XHS_LABEL_SCALE * scaledDensity
-
-        val metrics = xhsLabelPaint.fontMetrics
-
-        val baseline = height / 2f - (metrics.ascent + metrics.descent) / 2f
-
-
-
-        for ((visualIndex, index) in enabledIndices.withIndex()) {
-
-            val centerX = horizontalPadding + (visualIndex + 0.5f) * slotWidth
-
-            canvas.save()
-
-            canvas.scale(extraScale, extraScale, centerX, height / 2f)
-
-            if (index == XHS_PUBLISH_INDEX) {
-
-                val half = 20f * density
-
-                val publishRect = RectF(
-
-                    centerX - half,
-
-                    height / 2f - half,
-
-                    centerX + half,
-
-                    height / 2f + half,
-
-                )
-
-                bilibiliIconPaint.style = Paint.Style.FILL
-
-                bilibiliIconPaint.color = accentColor
-
-                canvas.drawRoundRect(publishRect, 12f * density, 12f * density, bilibiliIconPaint)
-
-                bilibiliIconPaint.style = Paint.Style.STROKE
-
-                bilibiliIconPaint.strokeWidth = 3.2f * density
-
-                bilibiliIconPaint.strokeCap = Paint.Cap.ROUND
-
-                bilibiliIconPaint.color = Color.WHITE
-
-                canvas.drawLine(centerX - 7f * density, height / 2f, centerX + 7f * density, height / 2f, bilibiliIconPaint)
-
-                canvas.drawLine(centerX, height / 2f - 7f * density, centerX, height / 2f + 7f * density, bilibiliIconPaint)
-
-                bilibiliIconPaint.style = Paint.Style.FILL
-
-            } else {
-
-                xhsLabelPaint.color = if (index == selectedIndex) accentColor else unselectedColor
-
-                canvas.drawText(labels[index], centerX, baseline, xhsLabelPaint)
-
-            }
-
-            canvas.restore()
-
+        val mix = frame.navigationOpticalMix.coerceIn(0f, 1f)
+        if (mix <= 0f || selectionPath.isEmpty) { drawSource(); return true }
+        // Match Spotify's live geometry mask: outside is always normal artwork;
+        // inside comes from the selected-artwork scene refracted by the lens.
+        val outside = canvas.save()
+        canvas.clipOutPath(selectionPath)
+        drawSource()
+        canvas.restoreToCount(outside)
+        if (mix < 1f) {
+            val inside = canvas.save()
+            canvas.clipPath(selectionPath)
+            canvas.saveLayerAlpha(0f, 0f, frame.width.toFloat(), frame.height.toFloat(),
+                ((1f - mix) * 255f).toInt())
+            drawSource()
+            canvas.restoreToCount(inside)
         }
-
+        return true
     }
 
-
-
-
+    override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = renderer.draw(canvas, frame)
     /**
 
      * XHS places transient circular actions (for example, back-to-top) against
@@ -281,11 +285,11 @@ internal class XhsNavigationState : AppNavigationState {
         lastActionScan = now
         val density = host.resources.displayMetrics.density
 
-        if (!host.isAttachedToWindow) return
+        if (!host.isAttachedToWindow || !host.isShown || host.windowVisibility != View.VISIBLE) return
 
         val root = host.rootView as? ViewGroup ?: return
 
-        val hostLocation = IntArray(2).also(host::getLocationOnScreen)
+        val hostLocation = actionHostPosition.also(host::getLocationOnScreen)
 
         val hostTop = hostLocation[1]
 
@@ -315,7 +319,7 @@ internal class XhsNavigationState : AppNavigationState {
 
             val (view, depth) = stack.removeLast()
 
-            if (view === host || view === source) continue
+            if (view === host || view === source || view is GlassHostLayout || view is AdapterOwnedOverlay) continue
 
             if (view.visibility != View.VISIBLE || view.alpha <= 0f) continue
 
@@ -327,7 +331,7 @@ internal class XhsNavigationState : AppNavigationState {
 
             if (compact && view.isClickable && view.isShown) {
 
-                val location = IntArray(2).also(view::getLocationOnScreen)
+                val location = actionPosition.also(view::getLocationOnScreen)
 
                 val base = xhsFloatingActionBaseTranslations.getOrPut(view) { view.translationY }
 
@@ -371,7 +375,9 @@ internal class XhsNavigationState : AppNavigationState {
 
             }
 
-            if (view is ViewGroup && depth < 14) {
+            // Feed cells are business content, never floating page chrome.
+            // Do not inspect hundreds of card descendants every 200ms.
+            if (view is ViewGroup && depth < 14 && !isRecyclerList(view)) {
 
                 for (index in view.childCount - 1 downTo 0) {
 
@@ -385,7 +391,7 @@ internal class XhsNavigationState : AppNavigationState {
 
 
 
-        xhsFloatingActionBaseTranslations.entries.toList().forEach { (view, base) ->
+        xhsFloatingActionBaseTranslations.entries.forEach { (view, base) ->
 
             if (view !in touched && view.isAttachedToWindow && view.translationY != base) {
 
@@ -407,8 +413,5 @@ internal class XhsNavigationState : AppNavigationState {
             "getIndexHome", "getIndexStore", "getIndexPost", "getIndexMessage", "getIndexMe",
         )
         const val SCROLLABLE_PAGER_CLASS = "com.xingin.redview.viewpage.ExploreScrollableViewPager"
-        const val XHS_LABEL_SCALE = 1.2f
-        const val XHS_PUBLISH_INDEX = 2
-        val labels = arrayOf("首页", "市集", "", "消息", "我")
     }
 }

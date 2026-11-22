@@ -6,6 +6,8 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
@@ -16,7 +18,26 @@ import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 internal class DouyinNavigationRenderer(private val context: Context) {
     private val defaultIcons = arrayOfNulls<Bitmap>(5)
     private val selectedIcons = arrayOfNulls<Bitmap>(5)
-    private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private var loadedDefaults: List<Bitmap?>? = null
+    private var loadedSelected: List<Bitmap?>? = null
+    private var artworkFailureReported = false
+    private fun artwork(name: String): Bitmap? = runCatching {
+        val bytes = requireNotNull(DouyinIconArtwork.bytes(name))
+        requireNotNull(BitmapFactory.decodeByteArray(bytes, 0, bytes.size))
+    }.onFailure {
+        if (!artworkFailureReported) {
+            artworkFailureReported = true
+            android.util.Log.w("LiquidTab", "Douyin embedded artwork unavailable: $name", it)
+        }
+    }.getOrNull()
+    private val iconNames = arrayOf("home", "friends", "publish", "inbox", "profile")
+    private val lightSelectedColor = Color.rgb(44, 44, 44)
+    private val lightNormalColor = Color.rgb(180, 178, 185)
+    private val darkSelectedTint = PorterDuffColorFilter(Color.WHITE, PorterDuff.Mode.SRC_IN)
+    private val darkNormalTint = PorterDuffColorFilter(Color.rgb(205, 203, 210), PorterDuff.Mode.SRC_IN)
+    private val lightSelectedTint = PorterDuffColorFilter(lightSelectedColor, PorterDuff.Mode.SRC_IN)
+    private val lightNormalTint = PorterDuffColorFilter(lightNormalColor, PorterDuff.Mode.SRC_IN)
+    private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply { style = Paint.Style.FILL }
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create("sans-serif", Typeface.NORMAL)
@@ -24,44 +45,60 @@ internal class DouyinNavigationRenderer(private val context: Context) {
 
     fun draw(canvas: Canvas, frame: AdapterNavigationFrame) = with(frame) {
         if (width <= 0 || height <= 0) return
-        val names = arrayOf("home", "friends", "publish", "inbox", "profile")
-        val moduleAssets = runCatching {
-            context.createPackageContext(MODULE_PACKAGE, Context.CONTEXT_IGNORE_SECURITY).assets
-        }.getOrNull()
-        val defaults = names.mapIndexed { i, n -> defaultIcons[i] ?: moduleAssets?.let { assets ->
-            runCatching { assets.open("tiktok/$n.png").use(BitmapFactory::decodeStream) }.getOrNull()
-                ?.also { defaultIcons[i] = it }
-        } }
-        val selected = names.mapIndexed { i, n ->
-            if (i == 2) defaults[i] else selectedIcons[i] ?: moduleAssets?.let { assets ->
-                runCatching { assets.open("tiktok/${n}_fill.png").use(BitmapFactory::decodeStream) }.getOrNull()
-                    ?.also { selectedIcons[i] = it }
-            }
+        val visibleSlots = enabledIndices.toIntArray()
+        val useLightNavigation = !darkGlass && (selectedIndex == 3 || selectedIndex == 4)
+        val names = iconNames
+        val defaults = loadedDefaults ?: names.mapIndexed { i, n ->
+            defaultIcons[i] ?: artwork(n)?.also { defaultIcons[i] = it }
         }
-        if (defaults.all { it != null } && selected.all { it != null }) {
+        val selected = loadedSelected ?: names.mapIndexed { i, n ->
+            if (i == 2) defaults[i] else selectedIcons[i]
+                ?: artwork("${n}_fill")?.also { selectedIcons[i] = it } ?: defaults[i]
+        }
+        val required = names.indices.filter { it != 2 || barLayout == null }
+        if (required.all { defaults[it] != null && selected[it] != null }) {
+            loadedDefaults = defaults
+            loadedSelected = selected
             val sw = slotWidth
             val pad = 4f * density
             val iconHeight = 29f * density
             labelPaint.textSize = textSize * scaledDensity
             val baseIconCenterY = height * .30f
             val baseLabelBaseline = height * .78f
-            val groupTop = baseIconCenterY - iconHeight / 2f
-            val groupBottom = baseLabelBaseline + labelPaint.fontMetrics.bottom
-            val groupOffsetY = height / 2f - (groupTop + groupBottom) / 2f
+            val groupOffsetY = DouyinIconLayout.groupOffset(height.toFloat(), iconHeight,
+                labelPaint.fontMetrics.bottom, iconOnly)
             val iconCenterY = baseIconCenterY + groupOffsetY
             val labelBaseline = baseLabelBaseline + groupOffsetY
             val labels = arrayOf("首页", "朋友", "", "消息", "我")
             for (slot in 0..4) {
-                val centerX = pad + (slot + .5f) * sw
+                if (slot !in enabledIndices && slot != barLayout?.actionIndex) continue
+                val centerX = barLayout?.let { layout ->
+                    if (slot == layout.actionIndex) layout.actionLeft + layout.actionSize / 2f
+                    else DouyinIconLayout.center(slot, visibleSlots, pad, sw)
+                } ?: DouyinIconLayout.center(slot, visibleSlots, pad, sw)
+                if (slot == 2 && barLayout != null) {
+                    if (!hideSelectedForOptics) drawDetachedPublish(canvas, frame, centerX)
+                    continue
+                }
                 canvas.save()
                 canvas.scale(extraScale, extraScale, centerX, height / 2f)
-                val bitmap = (if (slot == selectedIndex) selected[slot] else defaults[slot])!!
-                val drawHeight = if (slot == 2) iconHeight * 1.8f else iconHeight
+                val geometricMask = navigationOpticalMix > 0f
+                val accented = if (geometricMask) hideSelectedForOptics else slot == selectedIndex
+                val bitmap = (if (accented) selected[slot] else defaults[slot])!!
+                // Tint the original alpha artwork; keep the publish button's
+                // cyan/red accents and the existing dark-mode artwork intact.
+                iconPaint.colorFilter = when {
+                    slot == 2 -> null
+                    useLightNavigation -> if (accented) lightSelectedTint else lightNormalTint
+                    geometricMask -> if (accented) darkSelectedTint else darkNormalTint
+                    else -> null
+                }
+                val drawHeight = if (slot == 2) {
+                    if (barLayout != null) minOf(iconHeight * 1.8f, barLayout.actionSize * .70f) else iconHeight * 1.8f
+                } else iconHeight
                 val drawCenterY = if (slot == 2) height / 2f else iconCenterY
                 val ratio = bitmap.width.toFloat() / bitmap.height
-                val selectedInOpticalLayer = navigationOpticalMix > 0f
-                val drawSelectedGroup = !hideSelectedForOptics ||
-                    slot != selectedIndex || selectedInOpticalLayer
+                val drawSelectedGroup = true
                 if (drawSelectedGroup) {
                     canvas.drawBitmap(
                         bitmap,
@@ -76,7 +113,9 @@ internal class DouyinNavigationRenderer(private val context: Context) {
                     )
                 }
                 if (drawSelectedGroup && slot != 2 && !iconOnly) {
-                    labelPaint.color = if (slot == selectedIndex) Color.WHITE else Color.rgb(205, 203, 210)
+                    labelPaint.color = if (accented) {
+                        if (useLightNavigation) lightSelectedColor else Color.WHITE
+                    } else if (useLightNavigation) lightNormalColor else Color.rgb(205, 203, 210)
                     canvas.drawText(labels[slot], centerX, labelBaseline, labelPaint)
                 }
                 canvas.restore()
@@ -87,14 +126,21 @@ internal class DouyinNavigationRenderer(private val context: Context) {
         if (width <= 0 || height <= 0) return
         val slotWidth = slotWidth
         val pad = 4f * density
-        val iconSize = 23f * density
-        val iconY = height * 0.31f
-        val labelY = height * 0.78f
+        val iconSize = 29f * density
         val labels = arrayOf("首页", "朋友", "消息", "我")
-        val selectedColor = Color.WHITE
-        val normalColor = if (darkGlass) Color.rgb(205, 203, 210) else Color.rgb(44, 44, 44)
+        val selectedColor = if (useLightNavigation) lightSelectedColor else Color.WHITE
+        val normalColor = if (useLightNavigation) lightNormalColor else Color.rgb(205, 203, 210)
+        iconPaint.colorFilter = null
         labelPaint.textSize = textSize * scaledDensity
-        val publishCx = pad + 2.5f * slotWidth
+        val groupOffset = DouyinIconLayout.groupOffset(height.toFloat(), iconSize,
+            labelPaint.fontMetrics.bottom, iconOnly)
+        val iconY = height * .30f + groupOffset
+        val labelY = height * .78f + groupOffset
+        val publishCx = barLayout?.let { it.actionLeft + it.actionSize / 2f }
+            ?: DouyinIconLayout.center(2, visibleSlots, pad, slotWidth)
+        if (barLayout != null) {
+            if (!hideSelectedForOptics) drawDetachedPublish(canvas, frame, publishCx)
+        } else if (!publishCx.isNaN()) {
         canvas.save()
         canvas.scale(extraScale, extraScale, publishCx, height / 2f)
         iconPaint.style = Paint.Style.FILL
@@ -117,27 +163,31 @@ internal class DouyinNavigationRenderer(private val context: Context) {
         canvas.drawLine(publishCx - 8f * density, height / 2f, publishCx + 8f * density, height / 2f, iconPaint)
         canvas.drawLine(publishCx, height / 2f - 8f * density, publishCx, height / 2f + 8f * density, iconPaint)
         canvas.restore()
+        }
         for (i in 0 until 4) {
             val slot = if (i < 2) i else i + 1
-            val cx = pad + (slot + 0.5f) * slotWidth
+            if (slot !in enabledIndices) continue
+            val cx = DouyinIconLayout.center(slot, visibleSlots, pad, slotWidth)
             canvas.save()
             canvas.scale(extraScale, extraScale, cx, height / 2f)
-            iconPaint.color = if (slot == selectedIndex) selectedColor else normalColor
+            val accented = if (navigationOpticalMix > 0f) hideSelectedForOptics else slot == selectedIndex
+            iconPaint.color = if (accented) selectedColor else normalColor
             iconPaint.style = Paint.Style.STROKE
-            iconPaint.strokeWidth = 1.8f * density
+            // Coordinates below are in a 24-unit viewport; Canvas supplies density.
+            iconPaint.strokeWidth = 1.8f
             iconPaint.strokeCap = Paint.Cap.ROUND
             iconPaint.strokeJoin = Paint.Join.ROUND
             canvas.save(); canvas.translate(cx, iconY)
             canvas.scale(iconSize / 24f, iconSize / 24f)
             when (i) {
-                0 -> { iconPaint.style = Paint.Style.FILL; canvas.drawPath(parsePath("M2 10 12 2l10 8v10H14v-6h-4v6H2z"), iconPaint) }
+                0 -> { iconPaint.style = Paint.Style.FILL; canvas.translate(-12f, -11f); canvas.drawPath(parsePath("M2 10 12 2l10 8v10H14v-6h-4v6H2z"), iconPaint) }
                 1 -> { canvas.drawCircle(-4f, -5f, 3.5f, iconPaint); canvas.drawCircle(5f, -4f, 3f, iconPaint); canvas.drawArc(RectF(-10f, 1f, 2f, 13f), 205f, 130f, false, iconPaint); canvas.drawArc(RectF(0f, 2f, 10f, 13f), 205f, 130f, false, iconPaint) }
                 2 -> { canvas.drawRoundRect(RectF(-9f, -9f, 9f, 7f), 1.5f, 1.5f, iconPaint); canvas.drawLine(-4f, 7f, -4f, 11f, iconPaint); canvas.drawLine(-4f, 11f, 1f, 7f, iconPaint); canvas.drawLine(-5f, -1f, 5f, -1f, iconPaint) }
                 else -> { canvas.drawCircle(0f, -5f, 4f, iconPaint); canvas.drawArc(RectF(-9f, 1f, 9f, 15f), 205f, 130f, false, iconPaint) }
             }
             canvas.restore()
             iconPaint.style = Paint.Style.FILL
-            labelPaint.color = if (slot == selectedIndex) selectedColor else normalColor
+            labelPaint.color = if (accented) selectedColor else normalColor
             if (!iconOnly) canvas.drawText(labels[i], cx, labelY, labelPaint)
             canvas.restore()
         }
@@ -170,7 +220,29 @@ internal class DouyinNavigationRenderer(private val context: Context) {
         }
     }
 
+    /** Shared action surface uses the same configured fill as the main bar. */
+    private fun drawDetachedPublish(canvas: Canvas, frame: AdapterNavigationFrame, centerX: Float) {
+        val layout = frame.barLayout ?: return
+        // Fixed geometry: never apply the left slider's press scale here.
+        val half = minOf(9f * frame.density, layout.actionSize * .17f)
+        val centerY = frame.height / 2f
+        iconPaint.colorFilter = null
+        iconPaint.style = Paint.Style.STROKE
+        iconPaint.color = Color.WHITE
+        iconPaint.strokeWidth = 2.6f * frame.density
+        iconPaint.strokeCap = Paint.Cap.ROUND
+        canvas.drawLine(centerX - half, centerY, centerX + half, centerY, iconPaint)
+        canvas.drawLine(centerX, centerY - half, centerX, centerY + half, iconPaint)
+        iconPaint.style = Paint.Style.FILL
+    }
+
     private fun parsePath(data: String): Path = PathParser.createPathFromPathData(data) ?: Path()
 
     private companion object { const val MODULE_PACKAGE = "io.github.offlineglass" }
 }
+
+
+
+
+
+

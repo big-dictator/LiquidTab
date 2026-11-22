@@ -12,11 +12,31 @@ import android.content.Context
 
 /** Hide Taobao's separate full-width background/divider, retaining TabWidget as click adapter. */
 internal object TaobaoAdapter : TargetAdapter {
+    private data class ChromeIds(val background: Int,val divider: Int)
+    private val chromeIds=java.util.WeakHashMap<android.content.res.Resources,ChromeIds>()
+    override val flowingLiquidEnabled = false
+    override fun installHooks(
+        lpparam: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam,
+        spec: io.github.offlineglass.targets.TargetSpec
+    ) {
+        TaobaoCartInitialResource.install(lpparam.classLoader)
+        TaobaoFlashResource.install(lpparam.classLoader)
+        TaobaoNativePageTransactions.install(lpparam.classLoader)
+        TaobaoSplashHooks.install(lpparam.classLoader)
+    }
+
     override val key = "taobao"
+    override fun isNavigationEntryDisabled(index: Int, slots: Int): Boolean = slots == 5 && index == 1
     override val trackSourceDrawableIdentity = true
-    override val allowRenderNodeRefresh = true
+    override val trackSourceImageBackgroundIdentity = true
+    override val allowRenderNodeRefresh = false
+    override val ownsNavigationDrawing = true
+    override val drawsNavigationInOptics = true
+    override val usesNavigationOpticalMix = true
+    override val persistentNavigationOpticalMix = true
     override val observeWindowTouches = true
     override val ownsNavigationTap = true
+    override val commitSelectionAfterTap = true
     override val stagedNavigationSnapshot = true
     override val usesContentDarkMode = true
     // Homepage channels may be native, UC WebView or independently composed.
@@ -25,23 +45,30 @@ internal object TaobaoAdapter : TargetAdapter {
     override val usesOpticalSurfacePipeline = true
     override val allowsSystemBackgroundBlur = false
     override val keepsOpticalSurfaceDuringBarAnimation = true
+    // Native routing runs during the spring: its backdrop must advance with it.
+    override val keepsBackdropDuringTapTransition = true
     override val retainsOpticalSurfaceWhenBarHidden = true
     override val countsOpticalCompositorCopies = true
     // Share the same full-quality blur input between the panel and its lens.
     override val reuseOpticalBlur = true
-    // Animation submits through the app-owned worker, rather than also drawing
-    // from PixelCopy while the UI thread is submitting the same Surface.
+    override val reuseSurfaceBlurDuringBarAnimation = true
+    // Keep the indicator's own bloom, but do not refract the panel's thin
+    // outline a second time through the moving indicator lens.
+    override val samplesPanelHighlightInIndicator = false
+    // Animation submits through the app-owned worker.
     override val deferOpticalRenderDuringBarAnimation = true
-    override fun isOpticalSurfaceTab(selectedIndex: Int): Boolean = selectedIndex == 0 || selectedIndex == 3
+    // Keep one output across tabs: cart entry must not rebuild the compositor.
+    override fun isOpticalSurfaceTab(selectedIndex: Int): Boolean = selectedIndex in 0..4 && selectedIndex != 3
     override fun onWindowTouch(host: View, event: android.view.MotionEvent) {
         (host as? GlassHostLayout)?.appNavigationState
             ?.let { it as? TaobaoNavigationState }
             ?.onWindowTouch(host, event)
     }
-    override fun scrollStopHideTab(selectedIndex: Int): Boolean = selectedIndex == 2
+    override fun scrollStopHideTab(selectedIndex: Int): Boolean = false
     override fun scrollStopHideDelayMs(selectedIndex: Int): Long = if (selectedIndex == 0) 3_000L else 1_000L
     override fun resetScrollStopHideOnOtherTabs(): Boolean = true
-    override fun createNavigationState(context: Context): AppNavigationState = TaobaoNavigationState(context)
+    override fun createNavigationState(context: Context, host: GlassHostLayout): AppNavigationState =
+        TaobaoNavigationState(context, host)
     override fun createNativeChromeController(): AppNativeChromeController = object : AppNativeChromeController {
         override fun update(host: View, source: ViewGroup?) {
             ((host as? GlassHostLayout)?.appNavigationState as? TaobaoNavigationState)
@@ -68,12 +95,15 @@ internal object TaobaoAdapter : TargetAdapter {
         clearBackground(rowParent)
         if (rowParent.clipChildren) rowParent.clipChildren = false
         if (rowParent.clipToPadding) rowParent.clipToPadding = false
+        val ids=chromeIds.getOrPut(navigation.resources){
+            ChromeIds(navigation.resources.getIdentifier("uik_navigation_tab_background","id",navigation.context.packageName),
+                navigation.resources.getIdentifier("uik_navigation_tab_divide","id",navigation.context.packageName))
+        }
         val stack = ArrayDeque<Pair<View, Int>>()
         stack += rowParent to 0
         while (stack.isNotEmpty()) {
             val (view, depth) = stack.removeLast()
-            val id = resourceEntryName(view)
-            if (id == "uik_navigation_tab_background" || id == "uik_navigation_tab_divide") {
+            if ((ids.background!=0&&view.id==ids.background) || (ids.divider!=0&&view.id==ids.divider)) {
                 clearBackground(view)
                 if (view.alpha != 0f) view.alpha = 0f
             }
@@ -129,9 +159,5 @@ internal object TaobaoAdapter : TargetAdapter {
             current = parent
         }
     }
-
-    private fun resourceEntryName(view: View): String? = runCatching {
-        if (view.id == View.NO_ID) null else view.resources.getResourceEntryName(view.id)
-    }.getOrNull()
 
 }

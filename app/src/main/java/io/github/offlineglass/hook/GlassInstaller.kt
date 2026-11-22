@@ -20,9 +20,9 @@ import android.view.WindowInsets
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.TextView
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.adapters.TargetAdapterRegistry
 import io.github.offlineglass.hook.adapters.AdapterOwnedOverlay
@@ -61,10 +61,12 @@ internal fun globalGlassBottomGapPx(view: View): Int {
 }
 
 internal fun glassHostWidthPx(view: View, slots: Int, config: GlassConfig, density: Float): Int {
+    val widthSlots = TargetAdapterRegistry.forPackage(view.context.packageName)
+        ?.hostWidthSlotCount(slots, config) ?: slots
     val legacyAvailableWidth = (view.width - 24f * density).toInt()
         .coerceAtLeast((128f * density).toInt())
-    if (slots < 5) {
-        return min(legacyAvailableWidth, (slots * config.tabWidth * density).toInt())
+    if (widthSlots < 5) {
+        return min(legacyAvailableWidth, (widthSlots * config.tabWidth * density).toInt())
     }
 
     // Five-item bars need the same breathing room on the left and right as the
@@ -76,11 +78,15 @@ internal fun glassHostWidthPx(view: View, slots: Int, config: GlassConfig, densi
     val symmetricAvailableWidth = (screenWidth - sideGap * 2)
         .coerceAtLeast((128f * density).toInt())
     val availableWidth = min(legacyAvailableWidth, symmetricAvailableWidth)
-    return min(availableWidth, (slots * config.tabWidth * density).toInt())
+    return min(availableWidth, (widthSlots * config.tabWidth * density).toInt())
 }
 
-internal fun glassHostHeightPx(density: Float, config: GlassConfig, packageName: String = ""): Int {
-    return (config.barHeight * density).roundToInt().coerceAtLeast(1)
+internal fun glassHostHeightPx(density: Float, config: GlassConfig, packageName: String = "", slots: Int = 5): Int {
+    // Same pixel contract as ManagerGlassBottomBar, regardless of app resource
+    // density, package or tab count. Width, bottom gap and top bars are separate.
+    return io.github.offlineglass.rendering.BottomBarIndicatorStyle.compactBarHeightPx(
+        config.barHeight.coerceIn(GlassConfig.MIN_BAR_HEIGHT, GlassConfig.MAX_BAR_HEIGHT), density,
+    )
 }
 
     /**
@@ -129,24 +135,59 @@ internal fun symmetricGlassHostWidthPx(
     config: GlassConfig,
     slots: Int,
 ): Int {
+    val adapter = TargetAdapterRegistry.forPackage(view.context.packageName)
+    val referenceSlots = adapter?.hostWidthSlotCount(slots, config) ?: slots
+    if (referenceSlots != slots) {
+        // Install-time and live configuration updates enter this path for
+        // fewer tabs. Honor the adapter's five-tab reference before the
+        // generic compact-width calculation can overwrite it.
+        return glassHostWidthPx(view, referenceSlots, config, density)
+    }
     val screenWidth = view.width.coerceAtLeast(
         view.resources.displayMetrics.widthPixels,
     )
     val fullWidth = (screenWidth - 2 * symmetricGlassSideMarginPx(view, density))
         .coerceAtLeast((4 * config.tabWidth * density).toInt())
-    if (slots >= 4) return fullWidth
-    val slotWidth = (fullWidth - 8f * density) / 4f
-    return (8f * density + slotWidth * slots)
-        .toInt()
-        .coerceAtLeast((slots * config.tabWidth * density).toInt())
+    fun tabRowWidth(count: Int): Int {
+        if (count >= 4) return fullWidth
+        val slotWidth = (fullWidth - 8f * density) / 4f
+        return (8f * density + slotWidth * count)
+            .toInt()
+            .coerceAtLeast((count * config.tabWidth * density).toInt())
+    }
+    return adapter?.compactHostWidth(config, density, glassHostHeightPx(density, config), ::tabRowWidth)
+        ?: tabRowWidth(slots)
 }
 
 object GlassInstaller {
+    // Vendor capability discovery, including absence, is a class-level result.
+    // Never throw a missing-method exception on every native pre-draw.
+    private val immersiveStubGetters = HashMap<Class<*>, java.lang.reflect.Method?>()
+    private fun nativeImmersiveStub(decor: View): Any? {
+        val type = decor.javaClass
+        val getter = synchronized(immersiveStubGetters) {
+            if (!immersiveStubGetters.containsKey(type)) {
+                var owner: Class<*>? = type
+                var found: java.lang.reflect.Method? = null
+                while (owner != null && found == null) {
+                    found = owner.declaredMethods.singleOrNull {
+                        it.name == "getDecorViewImmersiveStub" && it.parameterCount == 0 &&
+                            !java.lang.reflect.Modifier.isStatic(it.modifiers)
+                    }?.apply { isAccessible = true }
+                    owner = owner.superclass
+                }
+                immersiveStubGetters[type] = found
+            }
+            immersiveStubGetters[type]
+        } ?: return null
+        return runCatching { getter.invoke(decor) }.getOrNull()
+    }
+
     private val installed = Collections.newSetFromMap(WeakHashMap<View, Boolean>())
     // Apps whose bottom bar is a natively floating pill inside a full-width
     // container: the host must follow the pill's real geometry instead of the
     // module's symmetric floating layout.
-    private val floatingPillKeys = setOf("mi_gallery", "mi_theme")
+    private val floatingPillKeys = setOf("mi_theme")
     // Theme Store's pill expands from the center right after attach, so the
     // first scans report a fraction of the final width. Track the last measured
     // rect per navigation and only trust geometry that was stable across two
@@ -158,6 +199,13 @@ object GlassInstaller {
     @Volatile
     private var lastPillRectTime = 0L
     private val activeHosts = WeakHashMap<Activity, WeakReference<GlassHostLayout>>()
+    internal fun hasActiveNavigationBinding(activity: Activity, source: ViewGroup? = null): Boolean {
+        val host = activeHosts[activity]?.get() ?: return false
+        val navigation = host.navigationSource ?: return false
+        return host.isAttachedToWindow && host.parent === activity.findViewById<View>(android.R.id.content) &&
+            navigation.isAttachedToWindow && navigation.isShown && navigation.width > 0 && navigation.height > 0 &&
+            navigation.rootView === activity.window.decorView && (source == null || navigation === source)
+    }
     private val navigationImmersiveApplied = WeakHashMap<Activity, Boolean>()
     private val originalNavigationBarState = WeakHashMap<Activity, NavigationBarState>()
     private val qqReadiness = WeakHashMap<ViewGroup, QqReadiness>()
@@ -242,9 +290,7 @@ object GlassInstaller {
         if (!enabled && WeChatChatTransitionState.isExiting(activity)) return
         val requiredFlags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or
             View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-        val immersiveStub = runCatching {
-            XposedHelpers.callMethod(decor, "getDecorViewImmersiveStub")
-        }.getOrNull()
+        val immersiveStub = nativeImmersiveStub(decor)
         val original = originalNavigationBarState.getOrPut(activity) {
             NavigationBarState(
                 systemUiVisibility = decor.systemUiVisibility,
@@ -372,6 +418,9 @@ object GlassInstaller {
             if (row !== navigation) return install(activity, row, visibleSlots, rawConfig, spec)
         }
         if (TargetAdapterRegistry.forSpec(spec)?.acceptsNavigationSource(navigation) == false) return false
+        if (navigation in installed &&
+            TargetAdapterRegistry.forSpec(spec)?.recheckNavigationBindingOnLayout == true &&
+            !hasActiveNavigationBinding(activity, navigation)) installed.remove(navigation)
         if (navigation in installed || navigation.parent is GlassHostLayout) {
             TargetAdapterRegistry.forSpec(spec)?.suppressNativeBottomChromeOnRebind(navigation)
             return true
@@ -388,6 +437,7 @@ object GlassInstaller {
         val originalParentBackground = parent.background
         val originalNavigationAlpha = navigation.alpha
         val originalNavigationBackground = navigation.background
+        val managesSourceAppearance = TargetAdapterRegistry.forSpec(spec)?.managesNavigationSourceAppearance == true
         val originalPadding = intArrayOf(
             navigation.paddingLeft,
             navigation.paddingTop,
@@ -454,15 +504,12 @@ object GlassInstaller {
             } else null
             val hostWidth = pillRect?.width()
                 ?: glassHostWidthPx(content, visibleSlots, config, density)
-            val hostHeight = if (TargetAdapterRegistry.forSpec(spec)?.floatingPillUsesConfiguredHeight == true) {
-                // Amap renders its own centered icons/labels, so it follows the
-                // module's configured bar height instead of the short native
-                // pill; the host is bottom-anchored, so it grows upward safely.
-                glassHostHeightPx(density, config, activity.packageName)
-            } else {
+            val configuredHostHeight = glassHostHeightPx(density, config, activity.packageName, visibleSlots)
+            val hostHeight = if (isFileManagerActionBar && visibleSlots > 4) {
+                // Native multi-select actions are not a tab navigation bar.
                 pillRect?.height()
-                    ?: glassHostHeightPx(density, config, activity.packageName)
-            }
+                    ?: configuredHostHeight
+            } else configuredHostHeight
             if (spec.key == "qq" || TargetAdapterRegistry.forSpec(spec)?.logNavigationHierarchy == true) {
                 logBottomHierarchy(navigation, content, spec.key.uppercase())
             }
@@ -474,7 +521,7 @@ object GlassInstaller {
             val looksLikeBottomShell = parent !== content &&
                 parent.height in 1..(196f * density).toInt() &&
                 parent.width >= content.width * 0.5f
-            if (looksLikeBottomShell || parent.height <= (196f * density).toInt()) {
+            if (!managesSourceAppearance && (looksLikeBottomShell || parent.height <= (196f * density).toInt())) {
                 parent.background = ColorDrawable(Color.TRANSPARENT)
             }
             // WeChat: preserve the original parent background so Xiaomi's
@@ -487,7 +534,6 @@ object GlassInstaller {
                 spec.supportsPostButton -> setOf(slots / 2)
                 // The rightmost gallery entry is the standalone search button:
                 // it stays a plain tap target and never receives the slider.
-                spec.key == "mi_gallery" -> setOf((slots - 1).coerceAtLeast(0))
                 // The file manager's main tab bar mirrors the gallery: 最近/浏览
                 // tabs plus a standalone circular search key on the right.
                 // The multi-select action bar (split_action_bar) is all plain
@@ -508,14 +554,16 @@ object GlassInstaller {
             content.clipChildren = false
             content.clipToPadding = false
             TargetAdapterRegistry.forSpec(spec)?.prepareContentForInstall(content)
-            navigation.background = ColorDrawable(Color.TRANSPARENT)
-            clearNavigationSurfaces(navigation)
-            TargetAdapterRegistry.forSpec(spec)?.suppressNativeBottomChrome(navigation)
-            if (spec.key == "qq" || TargetAdapterRegistry.forSpec(spec)?.clearSourceSelectionSurfaces == true) {
-                clearTabSelectionSurfaces(navigation, slots)
+            if (!managesSourceAppearance) {
+                navigation.background = ColorDrawable(Color.TRANSPARENT)
+                clearNavigationSurfaces(navigation)
+                TargetAdapterRegistry.forSpec(spec)?.suppressNativeBottomChrome(navigation)
+                if (spec.key == "qq" || TargetAdapterRegistry.forSpec(spec)?.clearSourceSelectionSurfaces == true) {
+                    clearTabSelectionSurfaces(navigation, slots)
+                }
+                navigation.setPadding(originalPadding[0], originalPadding[1], originalPadding[2], 0)
+                applyGlassOptions(navigation, slots, config, spec, density, hostWidth, hostHeight)
             }
-            navigation.setPadding(originalPadding[0], originalPadding[1], originalPadding[2], 0)
-            applyGlassOptions(navigation, slots, config, spec, density, hostWidth, hostHeight)
             if (spec.key == "mi_theme") {
                 // The theme store pill paints its moving selection indicator on
                 // a dedicated OverlayView that sits above the four tab rows.
@@ -547,7 +595,7 @@ object GlassInstaller {
             if (existingHost != null) {
                 existingHost.rebindNavigationSource(navigation, qqBottomChrome, config)
                 qqBottomChrome.forEach { it.visibility = View.INVISIBLE }
-                navigation.alpha = 0f
+                if (!managesSourceAppearance) navigation.alpha = 0f
                 if (TargetAdapterRegistry.forSpec(spec)?.navigationImmersionOverride != null) {
                     updateAdapterNavigationBarForPage(activity)
                 } else {
@@ -573,6 +621,9 @@ object GlassInstaller {
                 // search key as a plain tap target.
                 sliderEnabled = spec.key != "mi_file_manager" ||
                     resourceEntryName(navigation) != FILE_MANAGER_ACTION_BAR_ID,
+                // Only installed main bottom bars own cold-tab scheduling.
+                primaryNavigationHost = TargetAdapterRegistry.forSpec(spec)
+                    ?.defersColdTapUntilMotionSettles == true,
             ).apply {
                 // WeChat uses the same explicit tight shadow drawn by the
                 // manager bar. Do not stack Android's strongly downward-biased
@@ -652,7 +703,7 @@ object GlassInstaller {
                 ensureNavigationBarImmersion(activity)
             }
             qqBottomChrome.forEach { it.visibility = View.INVISIBLE }
-            if (TargetAdapterRegistry.forSpec(spec)?.keepNavigationSourceVisible != true) {
+            if (!managesSourceAppearance && TargetAdapterRegistry.forSpec(spec)?.keepNavigationSourceVisible != true) {
                 navigation.alpha = 0f
             }
             installed += navigation

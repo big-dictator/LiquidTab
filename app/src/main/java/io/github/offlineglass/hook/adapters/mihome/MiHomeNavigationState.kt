@@ -9,6 +9,7 @@ import android.view.ViewGroup
 import android.widget.TextView
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.adapters.localizeNavigationLabel
 
 /** Mi Home's APK-owned icon views and labels, drawn without scaling its native row. */
 internal class MiHomeNavigationState : AppNavigationState {
@@ -53,7 +54,7 @@ internal class MiHomeNavigationState : AppNavigationState {
         val navigation = findBottomNavigation(source, host.rootView) ?: return
         // The native indicator may wrap its tab views; prefer its own ordered list.
         val reflected = runCatching {
-            de.robv.android.xposed.XposedHelpers.callMethod(navigation, "getTabViewList") as? List<*>
+            io.github.offlineglass.hook.compat.XposedHelpers.callMethod(navigation, "getTabViewList") as? List<*>
         }.getOrNull()?.filterIsInstance<View>().orEmpty()
         if (reflected.size in 4..5) {
             items = reflected
@@ -87,7 +88,7 @@ internal class MiHomeNavigationState : AppNavigationState {
         val clicked = item?.performClick() == true
         val switched = clicked || findBottomNavigation(source, host.rootView)?.let { navigation ->
             runCatching {
-                de.robv.android.xposed.XposedHelpers.callMethod(navigation, "setCurrentItem", index)
+                io.github.offlineglass.hook.compat.XposedHelpers.callMethod(navigation, "setCurrentItem", index)
                 true
             }.getOrDefault(false)
         } == true
@@ -98,14 +99,14 @@ internal class MiHomeNavigationState : AppNavigationState {
     override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int? {
         val navigation = findBottomNavigation(source, source?.rootView ?: return null) ?: return null
         return runCatching {
-            (de.robv.android.xposed.XposedHelpers.callMethod(navigation, "getSelectedTabIndex") as? Number)?.toInt()
+            (io.github.offlineglass.hook.compat.XposedHelpers.callMethod(navigation, "getSelectedTabIndex") as? Number)?.toInt()
         }.getOrNull()?.takeIf { it in 0 until slotCount }
     }
 
     override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
         if (frame.slotCount !in 4..5) return
         val iconSize = 26f * 1.265f * frame.density
-        val iconCenterY = 20f * frame.density
+        val iconCenterY = if (frame.iconOnly) frame.height / 2f else 20f * frame.density
         val labelBaseline = 45.5f * frame.density
         val horizontalPadding = 4f * frame.density
         val labels = if (frame.slotCount == 4) LABELS_FOUR else LABELS_FIVE
@@ -138,7 +139,7 @@ internal class MiHomeNavigationState : AppNavigationState {
             val text = item?.let { readField(it, "mText") } as? TextView
             val label = text?.text?.toString()?.trim().orEmpty().ifEmpty { labels.getOrElse(index) { "" } }
             labelPaint.color = text?.currentTextColor ?: if (index == frame.selectedIndex) 0xFF2587E8.toInt() else normalColor
-            canvas.drawText(label, centerX, labelBaseline, labelPaint)
+            if (!frame.iconOnly || icon == null) canvas.drawText(frame.localizeNavigationLabel(label), centerX, labelBaseline, labelPaint)
             canvas.restore()
         }
     }

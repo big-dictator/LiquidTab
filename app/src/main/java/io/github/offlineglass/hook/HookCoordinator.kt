@@ -14,6 +14,7 @@ import java.util.WeakHashMap
 
 object HookCoordinator {
     private val sessions = WeakHashMap<Activity, ScannerSession>()
+    private val pendingNavigationScans = WeakHashMap<ViewGroup, Any>()
     private var predictiveBackHookAttempted = false
     private var lastResumedActivity: WeakReference<Activity>? = null
 
@@ -34,22 +35,22 @@ object HookCoordinator {
     private fun maybeHookPredictiveBackDispatcher(activity: Activity) {
         if (predictiveBackHookAttempted) return
         val dispatcherClass = runCatching {
-            de.robv.android.xposed.XposedHelpers.findClass(
+            io.github.offlineglass.hook.compat.XposedHelpers.findClass(
                 "androidx.activity.OnBackPressedDispatcher",
                 activity.classLoader,
             )
         }.getOrNull() ?: return
         predictiveBackHookAttempted = true
         runCatching {
-            de.robv.android.xposed.XposedBridge.hookAllMethods(
+            io.github.offlineglass.hook.compat.XposedBridge.hookAllMethods(
                 dispatcherClass,
                 "onBackPressed",
-                object : de.robv.android.xposed.XC_MethodHook() {
-                    override fun beforeHookedMethod(param: de.robv.android.xposed.XC_MethodHook.MethodHookParam) {
+                object : io.github.offlineglass.hook.compat.XC_MethodHook() {
+                    override fun beforeHookedMethod(param: io.github.offlineglass.hook.compat.XC_MethodHook.MethodHookParam) {
                         val current = lastResumedActivity?.get() ?: return
                         if (current.isFinishing || current.isDestroyed) return
                         val dispatcher = runCatching {
-                            de.robv.android.xposed.XposedHelpers.callMethod(
+                            io.github.offlineglass.hook.compat.XposedHelpers.callMethod(
                                 current,
                                 "getOnBackPressedDispatcher",
                             )
@@ -81,21 +82,38 @@ object HookCoordinator {
 
     fun onNavigationView(view: View, spec: TargetSpec) {
         val navigation = view as? ViewGroup ?: return
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+            navigation.post { onNavigationView(navigation, spec) }
+            return
+        }
         val activity = findActivity(view.context) ?: return
         if (!spec.covers(activity.packageName) || activity.isFinishing || activity.isDestroyed) return
+        // One burst owns an initial probe plus its terminal geometry checks.
+        // Repeated setTabs/selection notifications share that batch instead of
+        // multiplying config reads, hierarchy discovery and installation work.
+        if (pendingNavigationScans.containsKey(navigation)) return
+        val batch = Any()
+        pendingNavigationScans[navigation] = batch
         listOf(0L, 80L, 260L).forEach { delay ->
             navigation.postDelayed({
+                if (pendingNavigationScans[navigation] !== batch) return@postDelayed
+                if (delay == 260L) pendingNavigationScans.remove(navigation)
+                if (activity.isFinishing || activity.isDestroyed) return@postDelayed
                 if (!navigation.isAttachedToWindow || navigation.parent == null) return@postDelayed
+                val work: () -> Unit = work@ {
+                if (!navigation.isAttachedToWindow || activity.isFinishing || activity.isDestroyed) return@work
                 val config = HookConfigReader.read(activity, spec.packageName)
-                if (!config.enabled) return@postDelayed
+                if (!config.enabled) return@work
                 val slots = NavigationFinder.estimateSlotCount(navigation, spec)
                 // A mid-inflate row reports 0 (e.g. Meituan Takeout's
                 // server-driven tabs); installing that partial count would
                 // lock it in because install() is idempotent per source view.
-                if (slots < 2) return@postDelayed
+                if (slots < 2) return@work
                 if (GlassInstaller.install(activity, navigation, slots, config, spec)) {
                     HookConfigReader.reportActive(activity, spec.packageName)
                 }
+                }
+                if (!AnimationResourceGuard.defer(navigation, work)) work()
             }, delay)
         }
     }
@@ -128,6 +146,7 @@ private class ScannerSession(activity: Activity, private val spec: TargetSpec) {
     private val activityRef = WeakReference(activity)
     private var installed = false
     private var lastScan = 0L
+    private var recoveryScanPending = false
     private var listener: ViewTreeObserver.OnGlobalLayoutListener? = null
 
     fun scheduleScans() {
@@ -140,7 +159,22 @@ private class ScannerSession(activity: Activity, private val spec: TargetSpec) {
         }
         if (listener == null) {
             listener = ViewTreeObserver.OnGlobalLayoutListener {
-                if (!installed && SystemClock.uptimeMillis() - lastScan > 300L) scan()
+                val current = activityRef.get() ?: return@OnGlobalLayoutListener
+                if (installed && TargetAdapterRegistry.forSpec(spec)?.recheckNavigationBindingOnLayout == true &&
+                    !GlassInstaller.hasActiveNavigationBinding(current)) installed = false
+                if (!installed && SystemClock.uptimeMillis() - lastScan > 300L) {
+                    scan()
+                } else if (!installed && !recoveryScanPending &&
+                    TargetAdapterRegistry.forSpec(spec)?.recheckNavigationBindingOnLayout == true
+                ) {
+                    // A final layout inside the throttle window still deserves
+                    // one trailing scan; no polling loop when no tab is present.
+                    recoveryScanPending = true
+                    root.postDelayed({
+                        recoveryScanPending = false
+                        if (listener != null) scan()
+                    }, 310L)
+                }
             }.also { root.viewTreeObserver.addOnGlobalLayoutListener(it) }
         }
     }

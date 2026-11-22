@@ -1,24 +1,34 @@
 package io.github.offlineglass.ui
 
+
 import androidx.compose.foundation.shape.CornerBasedShape
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.util.fastCoerceAtMost
 import top.yukonga.miuix.kmp.blur.BackdropEffectScope
 import top.yukonga.miuix.kmp.blur.isRuntimeShaderSupported
 import top.yukonga.miuix.kmp.blur.runtimeShaderEffect
 
+internal var managerRefractionScale by androidx.compose.runtime.mutableFloatStateOf(1f)
+
 internal fun BackdropEffectScope.managerLens(
     refractionHeight: Float,
     refractionAmount: Float,
     depthEffect: Boolean = false,
     chromaticAberration: Float = 0f,
+    insetIndicator: ManagerInsetIndicatorShape? = null,
+    postureBlend: Float = 1f,
 ) {
-    if (!isRuntimeShaderSupported() || refractionHeight <= 0f || refractionAmount <= 0f) return
-    if (padding < refractionAmount) padding = refractionAmount
-    val cornerShape = shape as? CornerBasedShape ?: return
+    val amount = refractionAmount * managerRefractionScale
+    if (!isRuntimeShaderSupported() || refractionHeight <= 0f || amount <= 0f) return
+    val lensPadding = maxOf(refractionAmount, amount)
+    if (padding < lensPadding) padding = lensPadding
+    val cornerShape = shape as? CornerBasedShape
+    if (cornerShape == null && insetIndicator == null) return
     val maxRadius = size.minDimension / 2f
     val isLtr = layoutDirection == LayoutDirection.Ltr
-    val radii = floatArrayOf(
+    val radii = if (cornerShape == null) FloatArray(4) else floatArrayOf(
         (if (isLtr) cornerShape.topStart else cornerShape.topEnd).toPx(size, this),
         (if (isLtr) cornerShape.topEnd else cornerShape.topStart).toPx(size, this),
         (if (isLtr) cornerShape.bottomEnd else cornerShape.bottomStart).toPx(size, this),
@@ -35,33 +45,32 @@ internal fun BackdropEffectScope.managerLens(
         setFloatUniform("offset", -padding / sf, -padding / sf)
         setFloatUniform("cornerRadii", FloatArray(4) { radii[it].fastCoerceAtMost(maxRadius) / sf })
         setFloatUniform("refractionHeight", refractionHeight / sf)
-        setFloatUniform("refractionAmount", -refractionAmount / sf)
+        setFloatUniform("refractionAmount", -amount / sf)
         setFloatUniform("depthEffect", if (depthEffect) 1f else 0f)
+        val pose = io.github.offlineglass.rendering.PostureCompose.current
+        setFloatUniform("postureTilt", pose.x * postureBlend, pose.y * postureBlend)
+        setFloatUniform("flowMotionEnabled", 1f)
+        val root = io.github.offlineglass.rendering.PostureCompose.view.get()
+        setFloatUniform("fullSurfaceWeight", if (root != null &&
+            io.github.offlineglass.rendering.PostureGlass.isTracking(root)) postureBlend else 0f)
+        setFloatUniform("flowRipple", pose.rippleAmplitude * postureBlend, pose.rippleAge, pose.rippleX, pose.rippleY)
+        setFloatUniform("flowRebound", pose.reboundX * postureBlend, pose.reboundY * postureBlend)
+        setFloatUniform("continuousShape", if (insetIndicator != null) 1f else 0f)
+        if (insetIndicator != null) {
+            val contour = insetIndicator.contour(size, sf)
+            setFloatUniform("shapeOrientation", contour.orientation)
+            setFloatUniform("shapePoints", contour.points)
+        }
         if (dispersion) setFloatUniform("chromaticAberration", chromaticAberration)
     }
 }
 
 private const val SDF = """
-float radiusAt(float2 coord, float4 radii) {
-    if (coord.x >= 0.0) { if (coord.y <= 0.0) return radii.y; else return radii.z; }
-    else { if (coord.y <= 0.0) return radii.x; else return radii.w; }
-}
-float sdRoundedRect(float2 coord, float2 halfSize, float radius) {
-    float2 cornerCoord = abs(coord) - (halfSize - float2(radius));
-    float outside = length(max(cornerCoord, 0.0)) - radius;
-    float inside = min(max(cornerCoord.x, cornerCoord.y), 0.0);
-    return outside + inside;
-}
-float2 gradSdRoundedRect(float2 coord, float2 halfSize, float radius) {
-    float2 cornerCoord = abs(coord) - (halfSize - float2(radius));
-    if (cornerCoord.x >= 0.0 || cornerCoord.y >= 0.0) return sign(coord) * normalize(max(cornerCoord, 0.0));
-    float gradX = step(cornerCoord.y, cornerCoord.x);
-    return sign(coord) * float2(gradX, 1.0 - gradX);
-}
+${io.github.offlineglass.hook.GlassHostLayout.ROUNDED_RECT_SDF}
 float circleMap(float x) { return 1.0 - sqrt(1.0 - x * x); }
 """
 
-private const val LENS_SHADER = """
+private val LENS_SHADER = io.github.offlineglass.rendering.PostureGlass.wrap("""
 uniform shader content;
 uniform float2 size; uniform float2 offset; uniform float4 cornerRadii;
 uniform float refractionHeight; uniform float refractionAmount; uniform float depthEffect;
@@ -69,15 +78,17 @@ $SDF
 half4 main(float2 coord) {
     float2 halfSize = size * 0.5; float2 centeredCoord = (coord + offset) - halfSize;
     float radius = radiusAt(coord, cornerRadii); float sd = sdRoundedRect(centeredCoord, halfSize, radius);
+    float3 contour = float3(sd, 0.0, 0.0);
+    if (continuousShape > 0.5) { contour = continuousContour(coord + offset); sd = contour.x; }
     if (-sd >= refractionHeight) return content.eval(coord); sd = min(sd, 0.0);
     float d = circleMap(1.0 - -sd / refractionHeight) * refractionAmount;
     float gradRadius = min(radius * 1.5, min(halfSize.x, halfSize.y));
-    float2 grad = normalize(gradSdRoundedRect(centeredCoord, halfSize, gradRadius) + depthEffect * normalize(centeredCoord));
+    float2 grad = normalize((continuousShape > 0.5 ? contour.yz : gradSdRoundedRect(centeredCoord, halfSize, gradRadius)) + depthEffect * normalize(centeredCoord));
     return content.eval(coord + d * grad);
 }
-"""
+""")
 
-private const val DISPERSION_SHADER = """
+private val DISPERSION_SHADER = io.github.offlineglass.rendering.PostureGlass.wrap("""
 uniform shader content;
 uniform float2 size; uniform float2 offset; uniform float4 cornerRadii;
 uniform float refractionHeight; uniform float refractionAmount; uniform float depthEffect;
@@ -86,10 +97,12 @@ $SDF
 half4 main(float2 coord) {
     float2 halfSize = size * 0.5; float2 centeredCoord = (coord + offset) - halfSize;
     float radius = radiusAt(coord, cornerRadii); float sd = sdRoundedRect(centeredCoord, halfSize, radius);
+    float3 contour = float3(sd, 0.0, 0.0);
+    if (continuousShape > 0.5) { contour = continuousContour(coord + offset); sd = contour.x; }
     if (-sd >= refractionHeight) return content.eval(coord); sd = min(sd, 0.0);
     float d = circleMap(1.0 - -sd / refractionHeight) * refractionAmount;
     float gradRadius = min(radius * 1.5, min(halfSize.x, halfSize.y));
-    float2 grad = normalize(gradSdRoundedRect(centeredCoord, halfSize, gradRadius) + depthEffect * normalize(centeredCoord));
+    float2 grad = normalize((continuousShape > 0.5 ? contour.yz : gradSdRoundedRect(centeredCoord, halfSize, gradRadius)) + depthEffect * normalize(centeredCoord));
     float2 refractedCoord = coord + d * grad;
     float dispersionIntensity = chromaticAberration * ((centeredCoord.x * centeredCoord.y) / (halfSize.x * halfSize.y));
     float2 dispersedCoord = d * grad * dispersionIntensity; half4 color = half4(0.0);
@@ -102,4 +115,10 @@ half4 main(float2 coord) {
     half4 purple = content.eval(refractedCoord - dispersedCoord); color.r += purple.r/7.0; color.b += purple.b/3.0; color.a += purple.a/7.0;
     return color;
 }
-"""
+""")
+
+internal fun verifyManagerPostureShaders() {
+    android.graphics.RuntimeShader(LENS_SHADER)
+    android.graphics.RuntimeShader(DISPERSION_SHADER)
+}
+

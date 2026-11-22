@@ -11,6 +11,12 @@ class ConfigRequestReceiver : BroadcastReceiver() {
         if (intent.action != ConfigContract.ACTION_CONFIG_REQUEST) return
         val packageName = intent.getStringExtra(ConfigContract.EXTRA_REQUEST_PACKAGE).orEmpty()
         if (AppCatalog.forPackage(packageName) == null) return
-        LocalSettings.publishConfig(context, packageName)
+        if (isOrderedBroadcast) {
+            // A direct result channel avoids a second background broadcast,
+            // package-visibility restrictions and response registration races.
+            setResult(android.app.Activity.RESULT_OK, null, LocalSettings.configSnapshot(context, packageName))
+        } else {
+            LocalSettings.publishConfig(context, packageName)
+        }
     }
 }

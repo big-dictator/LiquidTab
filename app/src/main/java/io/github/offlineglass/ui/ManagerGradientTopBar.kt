@@ -1,5 +1,6 @@
 package io.github.offlineglass.ui
 
+
 import android.graphics.BlendMode
 import android.graphics.RenderEffect
 import android.graphics.RuntimeShader
@@ -8,6 +9,40 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.RenderEffect as ComposeRenderEffect
 import androidx.compose.ui.graphics.asComposeRenderEffect
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.graphics.rememberGraphicsLayer
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.unit.IntSize
+import kotlin.math.ceil
+
+/** Keep the exact Gaussian pyramid, but only run it over the visible top band. */
+@Composable
+internal fun Modifier.managerGradientTopBlur(
+    effect: ComposeRenderEffect?, veilHeightPx: Float, density: Float,
+): Modifier {
+    val scene = rememberGraphicsLayer()
+    val band = rememberGraphicsLayer()
+    return drawWithContent {
+        if (effect == null || veilHeightPx <= 0f) {
+            drawContent()
+        } else {
+            // One content traversal; the top band reuses its recorded display list.
+            scene.record { this@drawWithContent.drawContent() }
+            drawLayer(scene)
+            // Retain three Gaussian radii below the band, so its lower edge
+            // samples the same pixels as the old full-screen MIRROR pipeline.
+            val bandHeight = ceil((veilHeightPx + 96f * density).coerceAtMost(size.height)).toInt()
+            band.clip = true
+            band.renderEffect = effect
+            band.record(size = IntSize(ceil(size.width).toInt(), bandHeight)) {
+                drawLayer(scene)
+            }
+            clipRect(bottom = veilHeightPx.coerceAtMost(size.height)) { drawLayer(band) }
+        }
+    }
+}
 
 /**
  * Native Gaussian pyramid. Adjacent radius levels form a partition of unity:

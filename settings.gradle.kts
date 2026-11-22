@@ -18,4 +18,3 @@ dependencyResolutionManagement {
 
 rootProject.name = "LiquidTab"
 include(":app")
-include(":xposed-stubs")

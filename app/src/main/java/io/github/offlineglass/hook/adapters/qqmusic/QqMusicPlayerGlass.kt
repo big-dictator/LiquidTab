@@ -13,16 +13,40 @@ import java.util.WeakHashMap
 internal object QqMusicPlayerGlass {
     private val panels = WeakHashMap<ViewGroup, WeakReference<GlassHostLayout>>()
 
-    fun hasVisibleNativeContent(player: View): Boolean = listOf("g64", "fd7", "nbz", "g9t").any { entry ->
-        val id = QqMusicNativeChrome.id(player, entry)
-        val controls = player.findViewById<View>(id)
-        controls != null && controls.isShown && controls.alpha > 0.001f &&
-            controls.width > 0 && controls.height > 0
+    /**
+     * Native content is the visible player control surface (the minibar root and any
+     * inflated content slot). The wide skin plate holder and the tiny promo strip are
+     * not content. All checks are structural: no obfuscated slot ids are consulted.
+     */
+    fun hasVisibleNativeContent(player: View): Boolean {
+        if (player !is ViewGroup) return false
+        val density = player.resources.displayMetrics.density
+        for (index in 0 until player.childCount) {
+            val child = player.getChildAt(index)
+            if (child is GlassHostLayout) continue
+            if (isSkinHolder(child)) continue
+            val w = child.width
+            val h = child.height
+            // The promo strip is a shallow fixed-height float, not the control surface.
+            if (w > 0 && h > 0 && h <= 24f * density && w <= 160f * density) continue
+            if (child.isShown && child.alpha > 0.001f && w > 0 && h > 0) return true
+        }
+        return false
+    }
+
+    private fun isSkinHolder(view: View): Boolean {
+        if (view.javaClass.name == QqMusicBinding.SKIN_PLATE_CLASS) return true
+        if (view !is ViewGroup) return false
+        for (i in 0 until view.childCount) {
+            if (view.getChildAt(i).javaClass.name == QqMusicBinding.SKIN_PLATE_CLASS) return true
+        }
+        return false
     }
 
     fun attach(shell: ViewGroup) {
         val player = QqMusicNativeChrome.player(shell) as? FrameLayout ?: return
         if (!player.isAttachedToWindow || !player.isShown || player.width <= 0 || player.height <= 0) return
+        releaseShadowClipping(player, shell)
         panels[player]?.get()?.takeIf { it.parent === player }?.let { return }
         // A detach/re-attach can dispose a renderer without replacing its player root.
         for (index in player.childCount - 1 downTo 0) {
@@ -43,8 +67,8 @@ internal object QqMusicPlayerGlass {
         }
         player.clipChildren = false
         player.clipToPadding = false
-        // d7: g5t is the background holder; g64 and other original controls follow it.
-        // Insert before them, never above the native controls or their touch targets.
+        // The background holder leads; original controls follow it. Insert before
+        // them, never above the native controls or their touch targets.
         player.addView(panel, 0, parameters(player))
         panels[player] = WeakReference(panel)
         player.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
@@ -56,19 +80,35 @@ internal object QqMusicPlayerGlass {
         })
     }
 
+    private fun releaseShadowClipping(player: ViewGroup, shell: ViewGroup) {
+        // The outer shell frame also clips the player's overflow.
+        // Reassert before the cached-panel return: native layout may reset flags.
+        fun release(group: ViewGroup) {
+            if (group.clipChildren) group.clipChildren = false
+            if (group.clipToPadding) group.clipToPadding = false
+            if (group.clipToOutline) group.clipToOutline = false
+        }
+        release(player)
+        release(shell)
+        val outer = shell.parent as? ViewGroup ?: return
+        if (outer.javaClass.name == QqMusicBinding.SHELL_CLASS) {
+            release(outer)
+        }
+    }
+
     fun parameters(player: View): FrameLayout.LayoutParams {
-        // Match the extracted 46dp skin plate, with its original 14dp bottom offset.
-        return FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, QqMusicNativeChrome.dimension(player, "aiv", 46f)).apply {
+        // Match the extracted skin plate geometry (height and bottom offset).
+        val metrics = QqMusicBinding.plateMetrics(player)
+        return FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, metrics.heightPx).apply {
             gravity = Gravity.BOTTOM
-            bottomMargin = QqMusicNativeChrome.dimension(player, "aim", 14f)
+            bottomMargin = metrics.bottomMarginPx
         }
     }
 
     fun updateGeometry(panel: GlassHostLayout) {
         val player = panel.adapterNavigationSource ?: return
         if (panel.parent !== player) return
-        // Comments retain g5x while setting the actual controls GONE. Changing
-        // visibility also discards the retained glass drawing immediately;
+        // Changing visibility discards the retained glass drawing immediately;
         // a draw-time early return alone can leave the previous RenderNode frame.
         if (!hasVisibleNativeContent(player)) {
             if (panel.visibility != View.INVISIBLE) panel.visibility = View.INVISIBLE

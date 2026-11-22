@@ -22,6 +22,7 @@ internal class JdFlashControlsController(private val finder: JdChromeFinder) {
     }
 
     fun lift(root: ViewGroup, rootHeight: Int, host: View) {
+        if ((host as? io.github.offlineglass.hook.GlassHostLayout)?.adapterSelectedIndex != 0) return
         val rootWidth = root.width
         if (rootWidth <= 0 || rootHeight <= 0) return
         var liveBanner = banner?.get()
@@ -46,6 +47,7 @@ internal class JdFlashControlsController(private val finder: JdChromeFinder) {
     }
 
     fun correct(root: ViewGroup?, host: View) {
+        if ((host as? io.github.offlineglass.hook.GlassHostLayout)?.adapterSelectedIndex != 0) return
         val scene = root ?: return
         if (scene.height <= 0 || host.width <= 0 || host.height <= 0) return
         val hostLocation = IntArray(2).also(host::getLocationInWindow)

@@ -2,9 +2,8 @@ package io.github.offlineglass.hook.adapters.qqmusic
 
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.config.GlassConfig
 import io.github.offlineglass.hook.glassHostHeightPx
 import io.github.offlineglass.hook.globalGlassBottomGapPx
@@ -12,45 +11,39 @@ import kotlin.math.roundToInt
 import java.lang.ref.WeakReference
 import java.lang.reflect.Field
 import java.util.WeakHashMap
-import android.content.res.Resources
 
-/** Resource/class pairs are grounded in QQMusic 20.9.0.8 layout b0, d7 and c9. */
+/**
+ * Owns QQMusic's native chrome cleanup. Every structural decision is delegated to
+ * [QqMusicBinding]; this class holds only the relocation / suppression behaviour,
+ * so no obfuscated resource or member name is used to gate it.
+ */
 internal object QqMusicNativeChrome {
-    const val SHELL_CLASS = "com.tencent.qqmusic.ui.minibar.ClipBottomConstraintLayout"
-    private const val NAV_CLASS = "com.tencent.qqmusic.ui.minibar.navigation.MainDeskNavigateContainer"
+    // Retained for callers that locate the shell class by its semantic name.
+    const val SHELL_CLASS = QqMusicBinding.SHELL_CLASS
+
     private var guidelineFailureLogged = false
     private val scenes = WeakHashMap<View, WeakReference<View>>()
-    private val names = WeakHashMap<View, Pair<Int, String?>>()
     private val topFields = HashMap<Class<*>, Field>()
     private val guidelineFields = HashMap<Class<*>, List<Field>>()
-    private val resourceIds = WeakHashMap<Resources, MutableMap<String, Int>>()
-    fun isNavigation(view: View) = view.javaClass.name == NAV_CLASS && name(view) == "g5b"
 
-    fun navigation(shell: ViewGroup): ViewGroup? = (0 until shell.childCount)
-        .map { shell.getChildAt(it) }.firstOrNull(::isNavigation) as? ViewGroup
+    fun isNavigation(view: View) = QqMusicBinding.isNavigation(view)
 
-    fun player(shell: ViewGroup): ViewGroup? = (0 until shell.childCount)
-        .map { shell.getChildAt(it) }.firstOrNull { name(it) == "g5x" } as? ViewGroup
+    fun navigation(shell: ViewGroup): ViewGroup? = QqMusicBinding.navigationOf(shell)
+
+    fun player(shell: ViewGroup): ViewGroup? = QqMusicBinding.playerOf(shell)
 
     /** The home row remains VISIBLE behind pushed pages; StackLayout owns the foreground. */
     fun navigationPageVisible(source: View): Boolean {
         val stack = scene(source) ?: return false
-        if (name(stack) != "g65") return false
         val top = runCatching {
             topFields.getOrPut(stack.javaClass) {
                 stack.javaClass.getDeclaredField("mTop").apply { isAccessible = true }
             }.get(stack) as? View
-        }.getOrNull()
-            ?: return false
-        return name(top) == "g61"
+        }.getOrNull() ?: return false
+        return QqMusicBinding.isMainPage(top)
     }
 
-    fun isMainShell(view: ViewGroup): Boolean =
-        view.javaClass.name == SHELL_CLASS && name(view) in setOf("g5a", "g6h") &&
-            (0 until view.childCount).any {
-                val child = view.getChildAt(it)
-                name(child) == "g5b" && child.javaClass.name == NAV_CLASS
-            }
+    fun isMainShell(view: ViewGroup): Boolean = QqMusicBinding.isMainShell(view)
 
     fun clear(shell: ViewGroup, config: GlassConfig) {
         if (!isMainShell(shell)) return
@@ -62,26 +55,28 @@ internal object QqMusicNativeChrome {
         // already transparent here; release that crop before relocating the player.
         if (!navVisible) runCatching { XposedHelpers.callMethod(shell, "setClipBottom", 0f) }
         // Keep a small but tighter separation between the nav capsule and player.
-        // k0.I0 hides the native row by translating the entire shell down by w0().
-        // The guideline is relative to that translated shell, not the window bottom.
+        // The shell hides the native row by translating itself down; the guideline
+        // is relative to that translated shell, not the window bottom.
         val playerBottom = if (navVisible) glassHostHeightPx(density, config) + gap + gap / 2
             else gap + shell.translationY.roundToInt()
-        // b0: player.bottom = guideline + ktp(7.5dp); d7: plate.bottom is
-        // player.bottom - aim(14dp). Compensate both native offsets exactly.
-        val anchorOffset = dimension(shell, "aiq", 7.5f) - dimension(shell, "aim", 14f)
-        clearPlate(shell)
+        // b0: player.bottom = guideline + guide-space; the plate sits at
+        // player.bottom - plate-bottom. Compensate both native offsets exactly.
+        val player = player(shell)
+        val plateBottom = player?.let { QqMusicBinding.plateMetrics(it).bottomMarginPx }
+            ?: ((14f * density).toInt())
+        var guideline: View? = null
         for (index in 0 until shell.childCount) {
             val view = shell.getChildAt(index)
             if (QqMusicPromoHooks.suppress(view)) continue
-            when (name(view)) {
-                "g5b" -> if (view.javaClass.name == NAV_CLASS) {
+            when {
+                isNavigation(view) -> {
                     // Keep native lifecycle/selection updates; only its pixels are hidden.
                     if (view.alpha != 0f) view.alpha = 0f
                     clearPlate(view)
                 }
-                "g5_" -> positionPlayerGuideline(view, playerBottom + anchorOffset)
-                "hi7", "g5v" -> view.visibility = View.GONE
-                "g5x" -> {
+                QqMusicBinding.isGuideline(view) -> guideline = view
+                QqMusicBinding.isSkinPlate(view) -> view.visibility = View.GONE
+                QqMusicBinding.isPlayerRoot(view) -> {
                     clearPlayerBackground(view)
                     // Constrain the original controls together with their glass backdrop.
                     val params = view.layoutParams as? ViewGroup.MarginLayoutParams
@@ -92,6 +87,10 @@ internal object QqMusicNativeChrome {
                     }
                 }
             }
+        }
+        guideline?.let {
+            val guideSpace = QqMusicBinding.guidelineSpaceHeight(shell, it)
+            positionPlayerGuideline(it, playerBottom + guideSpace - plateBottom)
         }
     }
 
@@ -116,15 +115,14 @@ internal object QqMusicNativeChrome {
     }
 
     private fun clearPlayerBackground(player: View) {
-        // g5s is the wide skin plate. Album art, title, progress and playback controls
-        // are separate siblings under g64 and must keep their native listeners.
-        val background = player.findViewById<View>(id(player, "g5s"))
-        background?.visibility = View.INVISIBLE
+        // The wide skin plate is a MiniBarContentChangeImageView. Album art, title,
+        // progress and playback controls are separate siblings and keep their listeners.
+        QqMusicBinding.findSkinPlate(player)?.visibility = View.INVISIBLE
         clearPlate(player)
     }
 
     fun scene(source: View): View? {
-        // c9/fu: StackLayout is a full-window sibling of the minibar shell.
+        // StackLayout is a full-window sibling of the minibar shell.
         var shell: View? = source
         while (shell != null && shell.javaClass.name != SHELL_CLASS) shell = shell.parent as? View
         val shellRoot = shell ?: return null
@@ -137,11 +135,10 @@ internal object QqMusicNativeChrome {
             val parent = currentBranch.parent as? ViewGroup ?: return null
             val candidate = (0 until parent.childCount).map { parent.getChildAt(it) }
                 .filter { view ->
-                    view !== currentBranch && view.javaClass.name == "com.tencent.qqmusic.activity.base.StackLayout" &&
-                        view.isShown && view.width > 0 && view.height > 0 &&
-                        (name(view) in setOf("cvd", "o45") || view.width >= shellRoot.width * 0.75f)
+                    view !== currentBranch && view.javaClass.name == QqMusicBinding.STACK_CLASS &&
+                        view.isShown && view.width > 0 && view.height > 0
                 }
-                .maxByOrNull { it.width.toLong() * it.height }
+                .singleOrNull()
             if (candidate != null) {
                 scenes[shellRoot] = WeakReference(candidate)
                 return candidate
@@ -153,32 +150,25 @@ internal object QqMusicNativeChrome {
 
     /** StackLayout paints a separate transition rectangle after its page content. */
     fun ownsTransitionLayer(stack: ViewGroup): Boolean {
-        val root = stack.rootView
-        val shell = listOf("g5a", "g6h").firstNotNullOfOrNull { entry ->
-            root.findViewById<ViewGroup>(id(stack, entry))?.takeIf(::isMainShell)
-        } ?: return false
+        val root = stack.rootView as? ViewGroup ?: return false
+        val shell = findMainShell(root) ?: return false
         return scene(shell) === stack &&
             (navigation(shell)?.isShown == true || player(shell)?.isShown == true)
     }
 
-    fun id(view: View, entry: String): Int = resourceId(view, entry, "id")
-
-    private fun resourceId(view: View, entry: String, type: String): Int {
-        val cache = resourceIds.getOrPut(view.resources) { HashMap() }
-        return cache.getOrPut("$type/$entry") {
-            view.resources.getIdentifier(entry, type, targetSpec.packageName)
+    private fun findMainShell(root: ViewGroup): ViewGroup? {
+        val stack = ArrayDeque<View>()
+        stack.add(root)
+        var seen = 0
+        while (stack.isNotEmpty() && seen < 4000) {
+            val view = stack.removeFirst()
+            seen++
+            if (view is ViewGroup) {
+                if (isMainShell(view)) return view
+                for (i in 0 until view.childCount) stack.add(view.getChildAt(i))
+            }
         }
-    }
-
-    fun dimension(view: View, entry: String, fallbackDp: Float): Int {
-        val resource = resourceId(view, entry, "dimen")
-        return if (resource != 0) view.resources.getDimensionPixelSize(resource)
-        else (fallbackDp * view.resources.displayMetrics.density).toInt()
-    }
-
-    private fun name(view: View): String? {
-        names[view]?.takeIf { it.first == view.id }?.let { return it.second }
-        return AdapterNavigationSearch.resourceEntryName(view).also { names[view] = view.id to it }
+        return null
     }
 
     private fun clearPlate(view: View) {

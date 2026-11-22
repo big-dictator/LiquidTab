@@ -9,7 +9,7 @@ import android.os.*
 import android.view.*
 import android.widget.*
 import androidx.core.graphics.drawable.toBitmap
-import de.robv.android.xposed.*
+import io.github.offlineglass.hook.compat.*
 import io.github.offlineglass.hook.*
 import io.github.offlineglass.hook.GlassHostLayout.Companion.ROUNDED_RECT_REFRACTION_SHADER
 import io.github.offlineglass.hook.GlassHostLayout.Companion.BLOOM_STROKE_DUAL_SHADER
@@ -425,7 +425,7 @@ internal fun GlassHostLayout.adjustNeteaseMiniPlayer() {
 
                 ROUNDED_RECT_REFRACTION_SHADER,
 
-                runCatching { RuntimeShader(BLOOM_STROKE_DUAL_SHADER) }.getOrNull(),
+                runCatching { io.github.offlineglass.rendering.GlassEdgeHighlight.shader() }.getOrNull(),
 
             )
 
@@ -528,9 +528,13 @@ internal fun GlassHostLayout.adjustNeteaseMiniPlayer() {
 
         // Match the navigation panel's configured color and alpha exactly.
         // The optical backdrop still uses the same live blur radius above.
-        val playerFill = if (config.solidBarEnabled) Color.argb(
+        val configuredPlayerFill = if (config.solidBarEnabled) Color.argb(
             255, Color.red(basePlayerFill), Color.green(basePlayerFill), Color.blue(basePlayerFill),
         ) else basePlayerFill
+        val playerFill = Color.argb(
+            (Color.alpha(configuredPlayerFill) * config.spotifyBarOpacity.coerceIn(0f, 1f)).roundToInt(),
+            Color.red(configuredPlayerFill), Color.green(configuredPlayerFill), Color.blue(configuredPlayerFill),
+        )
 
         neteaseRuntime.miniPlayerGlassDrawable?.update(
 
@@ -548,7 +552,7 @@ internal fun GlassHostLayout.adjustNeteaseMiniPlayer() {
 
             } else {
 
-                0.75f
+                0.75f * if (config.liquidGlassEnabled) config.darkBarHighlightStrength else 1f
 
             },
 
@@ -1709,7 +1713,9 @@ internal fun GlassHostLayout.drawNeteaseMiniPlayerGlass(canvas: Canvas) {
 
             }
 
-            canvas.drawPath(neteaseRuntime.playerPath, neteaseRuntime.playerStrokePaint)
+            if (config.liquidGlassEnabled)
+                neteaseRuntime.glassEdge.draw(canvas, neteaseRuntime.playerPath, density, dark, (if (dark) .35f else .5f) * 2f * config.darkBarHighlightStrength)
+            else canvas.drawPath(neteaseRuntime.playerPath, neteaseRuntime.playerStrokePaint)
 
         }
 

@@ -3,10 +3,10 @@ package io.github.offlineglass.hook.adapters.wechat
 import android.app.Activity
 import android.view.KeyEvent
 import android.view.View
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 
 /** Preserved, currently dormant chat-exit hooks. Do not install without a separate regression pass. */
 internal object WeChatChatTransitionHooks {
@@ -136,7 +136,6 @@ internal object WeChatChatTransitionHooks {
         // not startAnimation alone (by then the list has already resumed).
         val entries = listOf(
             "com.tencent.mm.ui.LauncherUI" to "closeChatting",
-            "com.tencent.mm.ui.NewChattingTabUI" to "f",
             "com.tencent.mm.ui.conversation.BaseConversationUI" to "closeChatting",
         )
         for ((className, methodName) in entries) {
@@ -150,10 +149,7 @@ internal object WeChatChatTransitionHooks {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (param.args.size != 1 || param.args[0] !is Boolean) return
                     val owner = param.thisObject ?: return
-                    val activity = (owner as? Activity) ?: type.declaredFields.firstNotNullOfOrNull { field ->
-                        if (!Activity::class.java.isAssignableFrom(field.type)) null
-                        else runCatching { field.isAccessible = true; field.get(owner) as? Activity }.getOrNull()
-                    } ?: return
+                    val activity = owner as? Activity ?: return
                     if (!WeChatChatTransitionState.shouldSequenceWeChatChatBack(activity)) return
                     val args = param.args.clone()
                     param.setResult(if (method.returnType == Void.TYPE) null else true)

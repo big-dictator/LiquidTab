@@ -9,13 +9,12 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
-import android.view.PixelCopy
 import android.view.SurfaceControl
 import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.AdapterOwnedOverlay
 import io.github.offlineglass.hook.adapters.AppVideoBackdrop
@@ -24,8 +23,7 @@ import java.util.function.ObjIntConsumer
 
 /** Copies the decoder layer by value; never draws/reparents the native video View. */
 internal class YouTubeVideoSampler {
-    var snapshot: AppVideoBackdrop? = null
-        private set
+    private var snapshots: List<AppVideoBackdrop> = emptyList()
     var hasVideo = false
         private set
     private val main = Handler(Looper.getMainLooper())
@@ -40,14 +38,38 @@ internal class YouTubeVideoSampler {
     private var lastScan = 0L
     private var lastCopy = 0L
     private var copyStarted = 0L
-    private var generation = 0
+    private var lastCopyDuration = 0L
+    @Volatile private var generation = 0
     private var inFlight = false
     private var epoch = 0
     private var captureApi: CaptureApi? = null
     private var captureListener: Any? = null
     private var layerCaptureFailed = false
     private var loggedFailure = false
-    private val retired = ArrayDeque<Bitmap>()
+    private val retired = ArrayDeque<List<AppVideoBackdrop>>()
+    private var pendingFrames: MutableList<AppVideoBackdrop>? = null
+    private val panelPosition = IntArray(2)
+
+    fun frame(host: GlassHostLayout): AppVideoBackdrop? {
+        if (snapshots.isEmpty()) return null
+        host.getLocationInWindow(panelPosition)
+        val density = host.resources.displayMetrics.density
+        val padding = io.github.offlineglass.rendering.NativeBackdropBlur.padding(
+            host.config.blurRadius * density, 24f * density).toInt() + 1
+        val left = panelPosition[0] - padding
+        val top = panelPosition[1] - padding
+        val right = panelPosition[0] + host.width + padding
+        val bottom = panelPosition[1] + host.height + padding
+        var best: AppVideoBackdrop? = null
+        var bestArea = 0L
+        for (frame in snapshots) {
+            val width = minOf(right, frame.surfaceLeft + frame.surfaceWidth) - maxOf(left, frame.surfaceLeft)
+            val height = minOf(bottom, frame.surfaceTop + frame.surfaceHeight) - maxOf(top, frame.surfaceTop)
+            val area = if (width > 0 && height > 0) width.toLong() * height else 0L
+            if (area > bestArea) { best = frame; bestArea = area }
+        }
+        return best
+    }
 
     fun request(host: GlassHostLayout, allowed: Boolean) {
         if (!allowed || !host.isAttachedToWindow) {
@@ -71,14 +93,22 @@ internal class YouTubeVideoSampler {
         if (inFlight && now - copyStarted > 500L) {
             generation++
             inFlight = false
+            cancelPendingFrames()
         }
         if (host.alpha <= 0.001f || !host.isShown || !host.hasWindowFocus()) {
             main.removeCallbacks(wakeup)
             return
         }
-        if (inFlight || now - lastCopy < 32L) {
+        // Sampling at a fixed 32ms capped the optical video at ~31fps even
+        // on a 120Hz display. Requests remain single-flight and vsync driven.
+        val refresh = (host.display?.refreshRate?.takeIf { it.isFinite() && it > 0f }
+            ?: 60f)
+        // Follow the actual display rate and reserve elapsed time for app work.
+        // Slow readbacks automatically back off instead of accumulating jobs.
+        val interval = maxOf((1000f / refresh).toLong().coerceAtLeast(1L), lastCopyDuration * 4L)
+        if (inFlight || now - lastCopy < interval) {
             main.removeCallbacks(wakeup)
-            main.postDelayed(wakeup, if (inFlight) 32L else (32L - (now - lastCopy)).coerceAtLeast(1L))
+            main.postDelayed(wakeup, if (inFlight) interval else (interval - (now - lastCopy)).coerceAtLeast(1L))
             return
         }
         lastCopy = now
@@ -86,17 +116,23 @@ internal class YouTubeVideoSampler {
         val width = video.width
         val height = video.height
         if (width <= 0 || height <= 0) return
-        val hostLocation = IntArray(2).also(host::getLocationInWindow)
-        val density = host.resources.displayMetrics.density
-        val padding = io.github.offlineglass.rendering.NativeBackdropBlur.padding(
-            host.config.blurRadius * density, 24f * density).toInt() + 1
-        if (location[0] + width <= hostLocation[0] - padding ||
-            location[0] >= hostLocation[0] + host.width + padding ||
-            location[1] + height <= hostLocation[1] - padding ||
-            location[1] >= hostLocation[1] + host.height + padding) {
+        val regions = ArrayList<YouTubeCaptureRegions.Region>(6)
+        fun include(panel: GlassHostLayout) {
+            val position = panelPosition.also(panel::getLocationInWindow)
+            val density = panel.resources.displayMetrics.density
+            val padding = io.github.offlineglass.rendering.NativeBackdropBlur.padding(
+                panel.config.blurRadius * density, 24f * density).toInt() + 1
+            val left = (position[0] - location[0] - padding).coerceAtLeast(0)
+            val top = (position[1] - location[1] - padding).coerceAtLeast(0)
+            val right = (position[0] - location[0] + panel.width + padding).coerceAtMost(width)
+            val bottom = (position[1] - location[1] + panel.height + padding).coerceAtMost(height)
+            if (right > left && bottom > top) regions += YouTubeCaptureRegions.Region(left, top, right, bottom)
+        }
+        include(host)
+        if (regions.isEmpty()) {
             // A feed/mini-player video away from the glass cannot contribute
-            // pixels. Avoid full TextureView/PixelCopy buffers in that case.
-            if (snapshot != null) {
+            // pixels. Avoid full TextureView buffers in that case.
+            if (snapshots.isNotEmpty()) {
                 retireSnapshot()
                 host.postInvalidateOnAnimation()
             }
@@ -104,46 +140,75 @@ internal class YouTubeVideoSampler {
             return
         }
         val ticket = ++generation
+        copyStarted = now
         if (video is TextureView) {
             val frame = runCatching { video.getBitmap((width / 2).coerceAtLeast(1), (height / 2).coerceAtLeast(1)) }.getOrNull()
-            complete(host, video, ticket, frame, location[0], location[1], width, height)
+            complete(host, video, ticket, frame?.let {
+                listOf(AppVideoBackdrop(it, location[0], location[1], width, height, 0))
+            })
             return
         }
         val surface = video as? SurfaceView ?: return
         if (!surface.holder.surface.isValid) return
         inFlight = true
-        copyStarted = now
-        if (!layerCaptureFailed && Build.VERSION.SDK_INT >= 29) {
-            captureLayer(host, surface, ticket, location, width, height)
-        } else {
-            copyBuffer(host, surface, ticket, location, width, height)
-        }
+        captureRegions(host, surface, ticket, location, width, height,
+            YouTubeCaptureRegions.plan(regions).map { Rect(it.left, it.top, it.right, it.bottom) })
     }
 
-    private fun captureLayer(host: GlassHostLayout, video: SurfaceView, ticket: Int,
-                             location: IntArray, width: Int, height: Int) {
-        // The decoder's queue may not support PixelCopy on HyperOS. Capture its
+    private fun captureRegions(host: GlassHostLayout, video: SurfaceView, ticket: Int,
+                               location: IntArray, width: Int, height: Int, crops: List<Rect>) {
+        val frames = ArrayList<AppVideoBackdrop>(crops.size)
+        pendingFrames = frames
+        fun next(index: Int) {
+            if (ticket != generation) {
+                frames.forEach { it.bitmap.recycle() }; frames.clear(); return
+            }
+            if (index == crops.size) { complete(host, video, ticket, frames); return }
+            val crop = crops[index]
+            val result: (Bitmap?) -> Unit = { frame ->
+                if (ticket != generation || frame == null) {
+                    frames.forEach { it.bitmap.recycle() }
+                    frames.clear()
+                    frame?.recycle()
+                    complete(host, video, ticket, null)
+                } else {
+                    frames += AppVideoBackdrop(frame, location[0] + crop.left, location[1] + crop.top,
+                        crop.width(), crop.height(), 0)
+                    next(index + 1)
+                }
+            }
+            if (!layerCaptureFailed && Build.VERSION.SDK_INT >= 29) {
+                captureLayer(video, ticket, crop) { frame ->
+                    if (frame == null && ticket == generation) {
+                        layerCaptureFailed = true
+                        result(null)
+                    } else result(frame)
+                }
+            } else result(null)
+        }
+        // At most two sequential regions, one batch in flight. Publish both
+        // together so top and bottom never consume partially replaced input.
+        next(0)
+    }
+
+    private fun captureLayer(video: SurfaceView, ticket: Int, crop: Rect, result: (Bitmap?) -> Unit) {
+        // Capture the decoder's
         // own compositor layer, restricted to this process, as in the proven
         // Douyin path. Do not sample the window or duplicate its SurfaceView hole.
         val control = runCatching { video.surfaceControl }.getOrNull()
         if (control?.isValid != true) {
-            copyBuffer(host, video, ticket, location, width, height)
-            return
-        }
-        val hostLocation = IntArray(2).also(host::getLocationInWindow)
-        val padding = (host.config.blurRadius * host.resources.displayMetrics.density * 3f + 24f).toInt()
-        val crop = Rect(
-            (hostLocation[0] - location[0] - padding).coerceAtLeast(0),
-            (hostLocation[1] - location[1] - padding).coerceAtLeast(0),
-            (hostLocation[0] - location[0] + host.width + padding).coerceAtMost(width),
-            (hostLocation[1] - location[1] + host.height + padding).coerceAtMost(height),
-        )
-        if (crop.isEmpty) {
-            inFlight = false
-            retireSnapshot()
+            result(null)
             return
         }
         copyHandler().post {
+            if (ticket != generation) { main.post { result(null) }; return@post }
+            var delivered = false // Accessed only by main-thread completion messages.
+            fun deliver(frame: Bitmap?) {
+                main.post {
+                    if (delivered) frame?.recycle()
+                    else { delivered = true; result(frame) }
+                }
+            }
             runCatching {
                 val api = captureApi ?: run {
                     val cls = if (Build.VERSION.SDK_INT >= 34) {
@@ -156,7 +221,7 @@ internal class YouTubeVideoSampler {
                 }
                 val builder = HiddenApiBypass.newInstance(api.builder, control)
                 HiddenApiBypass.invoke(api.baseBuilder, builder, "setSourceCrop", crop)
-                HiddenApiBypass.invoke(api.baseBuilder, builder, "setFrameScale", 0.5f)
+                HiddenApiBypass.invoke(api.baseBuilder, builder, "setFrameScale", 1f)
                 HiddenApiBypass.invoke(api.baseBuilder, builder, "setUid", android.os.Process.myUid().toLong())
                 val args = HiddenApiBypass.invoke(api.builder, builder, "build")
                 val consumer = ObjIntConsumer<Any> { capture, status ->
@@ -174,84 +239,91 @@ internal class YouTubeVideoSampler {
                             buffer.close()
                         }
                     }.getOrNull() else null
-                    main.post {
-                        if (frame == null && ticket == generation) {
-                            layerCaptureFailed = true
-                            copyBuffer(host, video, ticket, location, width, height)
-                        } else complete(host, video, ticket, frame,
-                            location[0] + crop.left, location[1] + crop.top, crop.width(), crop.height())
-                    }
+                    deliver(frame)
                 }
                 val listener = HiddenApiBypass.newInstance(api.listener, consumer)
                 captureListener = listener
                 val status = HiddenApiBypass.invoke(api.capture, null, "captureLayers", args, listener) as Int
-                check(status == 0) { "captureLayers status=$status" }
+                if (status != 0) deliver(null)
             }.onFailure {
-                main.post {
-                    if (ticket == generation) {
-                        layerCaptureFailed = true
-                        copyBuffer(host, video, ticket, location, width, height)
-                    }
-                }
+                deliver(null)
             }
         }
     }
 
-    private fun copyBuffer(host: GlassHostLayout, video: SurfaceView, ticket: Int,
-                           location: IntArray, width: Int, height: Int) {
-        val frame = video.holder.surfaceFrame
-        val target = Bitmap.createBitmap(((frame.width().takeIf { it > 0 } ?: width) / 2).coerceAtLeast(1),
-            ((frame.height().takeIf { it > 0 } ?: height) / 2).coerceAtLeast(1), Bitmap.Config.ARGB_8888)
-        runCatching {
-            PixelCopy.request(video, null, target, { result ->
-                if (result != PixelCopy.SUCCESS) target.recycle()
-                complete(host, video, ticket, target.takeIf { result == PixelCopy.SUCCESS },
-                    location[0], location[1], width, height)
-            }, main)
-        }.onFailure {
-            target.recycle()
-            complete(host, video, ticket, null, location[0], location[1], width, height)
-        }
-    }
-
-    private fun complete(host: GlassHostLayout, video: View, ticket: Int, frame: Bitmap?,
-                         left: Int, top: Int, width: Int, height: Int) {
+    private fun complete(host: GlassHostLayout, video: View, ticket: Int, frames: List<AppVideoBackdrop>?) {
+        if (ticket == generation) pendingFrames = null
         if (ticket != generation || source !== video || !host.isAttachedToWindow || !video.isShown) {
-            frame?.recycle()
+            frames?.forEach { it.bitmap.recycle() }
             return
         }
         inFlight = false
         captureListener = null
-        if (frame == null) {
+        if (frames == null) {
             if (!loggedFailure) {
                 loggedFailure = true
-                XposedBridge.log("[OfflineGlass][YouTubeVideo] decoder layer and PixelCopy unavailable")
+                XposedBridge.log("[OfflineGlass][YouTubeVideo] decoder layer unavailable")
             }
             main.removeCallbacks(wakeup)
             main.postDelayed(wakeup, 250L)
             return
         }
         retireSnapshot()
-        snapshot = AppVideoBackdrop(frame, left, top, width, height, ++epoch)
+        lastCopyDuration = (SystemClock.uptimeMillis() - copyStarted).coerceIn(0L, 500L)
+        main.removeCallbacks(wakeup)
+        val nextEpoch = ++epoch
+        snapshots = frames.map { it.copy(epoch = nextEpoch) }
         host.postInvalidateOnAnimation()
     }
 
     private fun findVideo(root: View, host: View): View? {
         var best: View? = null
         var area = 0L
+        var overlap = 0L
+        val owned = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<View, Boolean>())
+        val panels = ArrayList<Rect>(6)
+        fun include(panel: GlassHostLayout) {
+            panel.opticalSurfaceViewForAdapter?.let { owned.add(it) }
+            val bounds = Rect()
+            if (!panel.isShown || panel.alpha <= .001f || !panel.getGlobalVisibleRect(bounds)) return
+            val density = panel.resources.displayMetrics.density
+            val padding = io.github.offlineglass.rendering.NativeBackdropBlur.padding(
+                panel.config.blurRadius * density, 24f * density).toInt() + 1
+            bounds.inset(-padding, -padding)
+            panels += bounds
+        }
+        (host as? GlassHostLayout)?.let(::include)
+        val bounds = Rect()
+        var visited = 0
+        val candidates = ArrayList<View>()
         val stack = ArrayDeque<Pair<View, Int>>()
         stack += root to 0
         while (stack.isNotEmpty()) {
             val (view, depth) = stack.removeLast()
-            if (view === host || view is GlassHostLayout || view is AdapterOwnedOverlay || !view.isShown) continue
-            val size = view.width.toLong() * view.height
-            if ((view is SurfaceView || view is TextureView) && view.width >= root.width * 0.5f &&
-                view.height >= root.height * 0.2f && size > area) {
-                best = view
-                area = size
+            if (++visited > 4096) return null
+            if (view is GlassHostLayout) {
+                view.opticalSurfaceViewForAdapter?.let { owned.add(it) }
+                continue
             }
+            if (view is AdapterOwnedOverlay || !view.isShown) continue
+            if (view is SurfaceView || view is TextureView) candidates += view
             if (view is ViewGroup && depth < 40) {
                 for (index in 0 until view.childCount) stack += view.getChildAt(index) to depth + 1
+            }
+        }
+        for (view in candidates) {
+            val size = view.width.toLong() * view.height
+            if (view !in owned && size > 0 && view.getGlobalVisibleRect(bounds)) {
+                // Source choice is about pixels under the glass, not which
+                // decoder happens to have the largest off-screen View.
+                val covered = panels.sumOf { panel ->
+                    val w = (minOf(bounds.right, panel.right) - maxOf(bounds.left, panel.left)).coerceAtLeast(0)
+                    val h = (minOf(bounds.bottom, panel.bottom) - maxOf(bounds.top, panel.top)).coerceAtLeast(0)
+                    w.toLong() * h
+                }
+                if (covered > overlap || (covered > 0 && covered == overlap && size > area)) {
+                    best = view; area = size; overlap = covered
+                }
             }
         }
         return best
@@ -264,30 +336,61 @@ internal class YouTubeVideoSampler {
     }
 
     private fun retireSnapshot() {
-        snapshot?.bitmap?.let(retired::addLast)
-        snapshot = null
+        if (snapshots.isNotEmpty()) retired.addLast(snapshots)
+        snapshots = emptyList()
         // Keep recently recorded frames alive across the UI/render-thread boundary.
-        while (retired.size > 3) retired.removeFirst().takeUnless(Bitmap::isRecycled)?.recycle()
+        while (retired.size > 3) retired.removeFirst().forEach { if (!it.bitmap.isRecycled) it.bitmap.recycle() }
     }
 
     private fun clear() {
+        val visibleHost = currentHost?.takeIf { snapshots.isNotEmpty() }
+        lastCopyDuration = 0L
+        lastCopy = 0L
         main.removeCallbacks(wakeup)
         currentHost = null
         generation++
+        cancelPendingFrames()
         inFlight = false
         source = null
         hasVideo = false
         captureListener = null
         retireSnapshot()
+        visibleHost?.postInvalidateOnAnimation()
     }
 
-    fun dispose() {
-        clear()
+    fun pause() {
+        // Preserve the bitmap referenced by Recents/display lists, while
+        // stopping readbacks, retries and worker activity.
+        generation++
+        cancelPendingFrames()
+        inFlight = false
+        captureListener = null
+        main.removeCallbacks(wakeup)
+        currentHost = null
         lastScan = 0L
         worker?.quitSafely()
         worker = null
         handler = null
-        while (retired.isNotEmpty()) retired.removeFirst().takeUnless(Bitmap::isRecycled)?.recycle()
+    }
+
+    /** A verified native tab change invalidates the old decoder dependency. */
+    fun invalidatePage() {
+        clear()
+        lastScan = 0L
+    }
+
+    fun dispose() {
+        clear()
+        pause()
+        while (retired.isNotEmpty()) retired.removeFirst().forEach { if (!it.bitmap.isRecycled) it.bitmap.recycle() }
+    }
+
+    private fun cancelPendingFrames() {
+        pendingFrames?.let { frames ->
+            frames.forEach { if (!it.bitmap.isRecycled) it.bitmap.recycle() }
+            frames.clear()
+        }
+        pendingFrames = null
     }
 
     private data class CaptureApi(val capture: Class<*>, val builder: Class<*>,

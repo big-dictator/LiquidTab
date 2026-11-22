@@ -6,13 +6,26 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XposedBridge
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /** Owns the folded-pinned-chats lift and touch proxy for one WeChat host. */
 internal class WeChatFoldController {
+    private var fullWidth = 0
     private val weChatFoldBarBaseTranslations = java.util.WeakHashMap<View, Float>()
+    private var managedRoot = java.lang.ref.WeakReference<View>(null)
+
+    private fun nativeVisible(view: View): Boolean {
+        if (!view.isShown || !view.getGlobalVisibleRect(Rect())) return false
+        var ancestor: View? = view
+        while (ancestor != null) {
+            if (ancestor.alpha <= 0.05f || ancestor.visibility != View.VISIBLE) return false
+            ancestor = ancestor.parent as? View
+        }
+        return true
+    }
+
     var weChatFoldBarTarget: View? = null
     var weChatFoldBarTouchProxy: WeChatFoldTouchProxy? = null
     private var lastWeChatFoldDiagMessage: String? = null
@@ -25,16 +38,52 @@ internal class WeChatFoldController {
         const val FOLD_BAR_MIN_HEIGHT_DP = 32f
         const val FOLD_BAR_MAX_HEIGHT_DP = 64f
         const val FOLD_INTERACTION_SETTLE_MS = 420L
-        val FOLD_BAR_ID_MARKERS = arrayOf("fold", "collapse", "top", "header", "footer")
+
     }
 
-    fun adjust(host: View, source: ViewGroup?, selected: Int, density: Float) {
+    fun adjust(host: View, source: ViewGroup?, selected: Int, density: Float, recentVisible: Boolean) {
+        (host as? io.github.offlineglass.hook.GlassHostLayout)?.let { glass ->
+            val parent = glass.parent as? View
+            if (parent != null) fullWidth = io.github.offlineglass.hook.symmetricGlassHostWidthPx(
+                parent, density, glass.config, 4)
+        }
+        if (managedRoot.get() !== host.rootView) {
+            managedRoot.get()?.let(WeChatFoldPresentation::release)
+            managedRoot = java.lang.ref.WeakReference(host.rootView)
+            WeChatFoldPresentation.manage(host.rootView)
+        }
 
         if (host.width <= 0 || host.height <= 0) return
+        val planB = (host as? io.github.offlineglass.hook.GlassHostLayout)?.config?.wechatFoldPlanB == true
+        val showPlanBButton = planB && selected == 0
+        if (!host.isShown || host.alpha <= 0.05f || recentVisible) {
+            restoreAllWeChatFoldBarTranslations()
+            hideWeChatFoldTouchProxy()
+            return
+        }
+
+        if (showPlanBButton && host is io.github.offlineglass.hook.GlassHostLayout) {
+            val root = host.rootView as? ViewGroup ?: return
+            restoreAllWeChatFoldBarTranslations()
+            weChatFoldBarTarget = null
+            val action = WeChatFoldPresentation.nativeAction(root)
+            val proxy = obtainProxy(root)
+            proxy.setPlanB(true)
+            proxy.configure(host, null)
+            proxy.clickTarget = null
+            proxy.beforeClick = null
+            val collapsed = action?.state()
+            proxy.setFoldState(collapsed)
+            proxy.togglePinnedChats = if (collapsed != null) action::toggle else null
+            positionButton(host, proxy)
+            proxy.showAnimated()
+            proxy.isEnabled = collapsed != null
+            return
+        }
 
         val now = SystemClock.uptimeMillis()
 
-        if (selected != 0) {
+        if (selected != 0 || planB) {
 
             restoreAllWeChatFoldBarTranslations()
 
@@ -74,12 +123,6 @@ internal class WeChatFoldController {
 
         if (!host.getGlobalVisibleRect(hostRect)) return
 
-        val gap = (FOLD_TO_GLASS_GAP_DP * density).roundToInt()
-
-        val targetBottom = hostRect.top - gap
-
-
-
         // Throttle the expensive view-tree search, but update the translation
 
         // every frame so the fold bar doesn't jump during list scrolling.
@@ -94,7 +137,7 @@ internal class WeChatFoldController {
 
         var target = cachedTarget
 
-            ?.takeIf { it.isAttachedToWindow && it.visibility == View.VISIBLE }
+            ?.takeIf { it.isAttachedToWindow && nativeVisible(it) && WeChatFoldPresentation.isFloating(it) }
 
         if (cachedTarget != null && target == null) {
 
@@ -136,91 +179,7 @@ internal class WeChatFoldController {
 
         if (target == null && doSearch) {
 
-            val minimumWidth = root.width * 0.82f
-
-            val minimumHeight = (FOLD_BAR_MIN_HEIGHT_DP * density).roundToInt()
-
-            val maximumHeight = (FOLD_BAR_MAX_HEIGHT_DP * density).roundToInt()
-
-            var bestScore = Int.MIN_VALUE
-
-            val stack = ArrayDeque<Pair<View, Int>>()
-
-            stack += root to 0
-
-            while (stack.isNotEmpty()) {
-
-                val (view, depth) = stack.removeLast()
-
-                if (view === host || view === source || view === weChatFoldBarTouchProxy) continue
-
-                if (view is ViewGroup && view.visibility == View.VISIBLE &&
-
-                    !isDescendantOf(view, source) &&
-
-                    !isDescendantOf(source ?: host, view) &&
-
-                    !isDescendantOf(host, view)
-
-                ) {
-
-                    val rect = Rect()
-
-                    // Search by text content and dimensions only �?do NOT
-
-                    // constrain by position relative to the glass host,
-
-                    // because once the fold bar is elevated its on-screen
-
-                    // rect moves above the host and would fail a positional
-
-                    // re-search, causing the target to be lost.
-
-                    if (view.alpha > 0.05f && view.getGlobalVisibleRect(rect) &&
-
-                        rect.width() >= minimumWidth &&
-
-                        view.height in minimumHeight..maximumHeight &&
-
-                        rect.height() in minimumHeight..maximumHeight &&
-
-                        hasWeChatFoldEdgeControls(view, root.width) &&
-
-                        !containsChatItemAvatar(view, density)
-
-                    ) {
-
-                        val idName = viewResourceEntryName(view).orEmpty().lowercase()
-
-                        val idBonus = if (FOLD_BAR_ID_MARKERS.any(idName::contains)) 700 else 0
-
-                        val backgroundBonus = if (view.background != null) 180 else 0
-
-                        val score = idBonus + backgroundBonus + rect.width() - rect.height()
-
-                        if (score > bestScore) {
-
-                            bestScore = score
-
-                            target = view
-
-                        }
-
-                    }
-
-                }
-
-                if (view is ViewGroup && depth < 28) {
-
-                    for (index in view.childCount - 1 downTo 0) {
-
-                        stack += view.getChildAt(index) to (depth + 1)
-
-                    }
-
-                }
-
-            }
+            target = WeChatFoldPresentation.nativeBanner(root)?.takeIf { nativeVisible(it) }
 
             if (target != null) {
 
@@ -252,57 +211,16 @@ internal class WeChatFoldController {
 
 
 
-        val bar = target ?: return
+        val bar = target ?: run { hideWeChatFoldTouchProxy(); return }
 
         if (bar.width <= 0 || bar.height <= 0) return
 
 
 
-        // Calculate the fold bar's natural bottom (without our translation)
+        // Leave native geometry and clipping untouched: native visibility and
+        // scrolling decide whether a replacement button may be presented.
 
-        // and set translationY so its bottom aligns with targetBottom.
-
-        // This runs every frame to track the fold bar's scrolling position
-
-        // without the 120ms jump caused by throttled recalculation.
-
-        val base = weChatFoldBarBaseTranslations.getOrPut(bar) { bar.translationY }
-
-        val location = IntArray(2).also(bar::getLocationInWindow)
-
-        val currentBottom = location[1] + bar.height
-
-        val baseBottom = currentBottom - (bar.translationY - base).roundToInt()
-
-        val wanted = base + (targetBottom - baseBottom)
-
-        if (abs(bar.translationY - wanted) > 0.5f) {
-
-            logWeChatFoldDiag(
-
-                "translate cur=${bar.translationY} wanted=$wanted " +
-
-                    "hostTop=${hostRect.top} targetBottom=$targetBottom",
-
-            )
-
-            bar.translationY = wanted
-
-        }
-
-        var ancestor = bar.parent as? ViewGroup
-
-        repeat(5) {
-
-            ancestor?.clipChildren = false
-
-            ancestor?.clipToPadding = false
-
-            ancestor = ancestor?.parent as? ViewGroup
-
-        }
-
-        updateWeChatFoldTouchProxy(root, bar)
+        updateWeChatFoldTouchProxy(root, bar, host)
 
     }
 
@@ -351,12 +269,12 @@ internal class WeChatFoldController {
     }
 
     fun hideWeChatFoldTouchProxy() {
-
         weChatFoldBarTouchProxy?.apply {
 
-            visibility = View.GONE
+            hideAnimated()
 
             clickTarget = null
+            togglePinnedChats = null
 
             beforeClick = null
 
@@ -384,27 +302,15 @@ internal class WeChatFoldController {
 
      */
 
-    private fun updateWeChatFoldTouchProxy(root: ViewGroup, bar: ViewGroup) {
+    private fun updateWeChatFoldTouchProxy(root: ViewGroup, bar: ViewGroup, host: View) {
+        val glass = host as? io.github.offlineglass.hook.GlassHostLayout ?: return
 
-        var proxy = weChatFoldBarTouchProxy
-
-        if (proxy == null) {
-
-            proxy = WeChatFoldTouchProxy(root.context)
-
-            weChatFoldBarTouchProxy = proxy
-
-        }
-
-        if (proxy.parent !== root) {
-
-            (proxy.parent as? ViewGroup)?.removeView(proxy)
-
-            root.addView(proxy, ViewGroup.LayoutParams(1, 1))
-
-        }
-
+        val proxy = obtainProxy(root)
+        proxy.togglePinnedChats = null
         proxy.clickTarget = WeChatFoldTouchProxy.findClickTarget(bar)
+        if (proxy.clickTarget == null) { hideWeChatFoldTouchProxy(); return }
+        proxy.configure(glass, bar)
+        proxy.setPlanB(glass.config.wechatFoldPlanB)
 
         proxy.beforeClick = {
 
@@ -430,38 +336,46 @@ internal class WeChatFoldController {
 
         }
 
-        val rootLocation = IntArray(2).also(root::getLocationInWindow)
+        positionButton(glass, proxy)
 
-        val barLocation = IntArray(2).also(bar::getLocationInWindow)
-
-        val left = barLocation[0] - rootLocation[0]
-
-        val top = barLocation[1] - rootLocation[1]
-
-        val params = proxy.layoutParams
-
-        if (params.width != bar.width || params.height != bar.height) {
-
-            params.width = bar.width
-
-            params.height = bar.height
-
-            proxy.layoutParams = params
-
-        }
-
-        // Translation participates in ViewGroup hit testing, unlike manually
-
-        // calling layout(), whose bounds DecorView replaces on its next pass.
-
-        proxy.translationX = left.toFloat()
-
-        proxy.translationY = top.toFloat()
-
-        proxy.visibility = View.VISIBLE
+        proxy.showAnimated()
 
         if (root.indexOfChild(proxy) != root.childCount - 1) proxy.bringToFront()
 
+    }
+
+    private fun obtainProxy(root: ViewGroup): WeChatFoldTouchProxy {
+        val proxy = weChatFoldBarTouchProxy ?: WeChatFoldTouchProxy(root.context).also {
+            weChatFoldBarTouchProxy = it
+        }
+        if (proxy.parent !== root) {
+            (proxy.parent as? ViewGroup)?.removeView(proxy)
+            root.addView(proxy, ViewGroup.LayoutParams(1, 1))
+        }
+        if (root.indexOfChild(proxy) != root.childCount - 1) proxy.bringToFront()
+        return proxy
+    }
+
+    private fun positionButton(host: io.github.offlineglass.hook.GlassHostLayout, proxy: WeChatFoldTouchProxy) {
+        val root = proxy.parent as? View ?: return
+        val origin = IntArray(2).also(root::getLocationInWindow)
+        val location = IntArray(2).also(host::getLocationInWindow)
+        val d = root.resources.displayMetrics.density
+        val b = proxy.planB
+        val w = if (b) host.height else fullWidth
+        val h = if (b) host.height else (48f * d).roundToInt()
+        val padding = proxy.shadowInset
+        val params = proxy.layoutParams
+        if (params.width != w + padding * 2 || params.height != h + padding * 2) {
+            params.width = w + padding * 2; params.height = h + padding * 2; proxy.layoutParams = params
+        }
+        val window = host.rootView
+        val windowLocation = IntArray(2).also(window::getLocationInWindow)
+        val screenLeft = windowLocation[0] + (window.width - fullWidth) / 2
+        // Same placement as X's publish button: right-aligned to the full
+        // bar, with a 24 dp gap above it. Shadow padding is not part of the gap.
+        proxy.translationX = screenLeft - origin[0] + (if (b) fullWidth - w else 0) - padding.toFloat() - proxy.left
+        proxy.translationY = location[1] - origin[1] - h - (if (b) 24f else 8f) * d - padding - proxy.top
     }
 
     private fun hasWeChatFoldEdgeControls(group: ViewGroup, rootWidth: Int): Boolean {
@@ -643,6 +557,8 @@ internal class WeChatFoldController {
     }
 
     fun dispose() {
+        managedRoot.get()?.let(WeChatFoldPresentation::release)
+        managedRoot.clear()
         weChatFoldBarTouchProxy?.let { proxy ->
             proxy.clickTarget = null
             proxy.beforeClick = null

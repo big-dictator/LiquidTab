@@ -12,7 +12,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
+import io.github.offlineglass.ui.ManagerMaterialText as Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -28,6 +28,18 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.ensureActive
+
+@Composable
+internal fun WarmAppIcons(installedPackages: Set<String>) {
+    val context = LocalContext.current.applicationContext
+    LaunchedEffect(installedPackages) {
+        io.github.offlineglass.targets.AppCatalog.uiTargets.forEach { target ->
+            kotlin.coroutines.coroutineContext.ensureActive()
+            if (target.packageName in installedPackages) AppIconCache.load(context, target.packageName)
+        }
+    }
+}
 
 @Composable
 fun AppIcon(packageName: String, displayName: String, modifier: Modifier = Modifier) {
@@ -35,9 +47,7 @@ fun AppIcon(packageName: String, displayName: String, modifier: Modifier = Modif
     var bitmap by remember(packageName) { mutableStateOf(AppIconCache.get(packageName)) }
     LaunchedEffect(packageName) {
         if (bitmap == null) {
-            bitmap = withContext(Dispatchers.IO) {
-                AppIconCache.load(context.applicationContext, packageName)
-            }
+            bitmap = AppIconCache.load(context.applicationContext, packageName)
         }
     }
     val staticImage = remember(bitmap) { bitmap?.asImageBitmap() }
@@ -85,12 +95,16 @@ private object AppIconCache {
                 val temporary = File(cacheDir, "$packageName.tmp")
                 FileOutputStream(temporary).use { output ->
                     bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
-                    output.fd.sync()
+                    // Disposable icon cache, not user data. Forcing a storage
+                    // flush per icon competes with cold page loading needlessly.
                 }
                 if (!temporary.renameTo(file)) temporary.delete()
             }
             bitmap
         }.getOrNull()?.also { bitmap ->
+            // Schedule texture preparation on the loader, not the first scroll
+            // frame that happens to expose this icon.
+            bitmap.prepareToDraw()
             synchronized(cache) { cache.put(packageName, bitmap) }
         }
     }

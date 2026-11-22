@@ -21,7 +21,6 @@ internal val targetSpec: TargetSpec = TargetSpec("amap", "com.autonavi.minimap",
             idHints = setOf("tab_container", "tab_bar", "tab_host"),
             classHints = setOf(
                 "com.autonavi.bundle.uitemplate.tab.LiteTabBar",
-                "com.autonavi.minimap.tabspage.base.C3TabBar",
                 "BootHomeTabPage",
             ),
             textHints = setOf("首页", "附近", "消息", "打车", "我的"),

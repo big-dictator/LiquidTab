@@ -1,42 +1,48 @@
 package io.github.offlineglass.hook.adapters.meituan
 
 import android.content.Context
-import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import io.github.offlineglass.hook.NavigationCandidate
-import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
 import io.github.offlineglass.hook.adapters.TargetAdapter
 import io.github.offlineglass.targets.TargetSpec
 
-/** Server-driven TitleIndicator must have its complete native tab set. */
+/** Native identity comes from a verified resource/role/input graph. */
 internal object MeituanTakeoutAdapter : TargetAdapter {
     override val key = "meituan"
     override val ownsNavigationFinding = true
     override val hasPerFrameScene = true
+    override val ownsNavigationTap = true
+    override val commitSelectionAfterTap = true
+    override val nativeSelectionReliable = true
+    override val trackSourceDrawableIdentity = true
+    override val stagedNavigationSnapshot = true
+    override val preserveNativeParentBackground = true
+    // This is the declared settings slot, not a native binding locator.
+    // Availability itself still follows the shared semantic binding.
+    override fun normalizeConfig(config: io.github.offlineglass.config.GlassConfig) =
+        config.copy(hiddenMask = targetSpec.automaticEntryIndices.fold(config.hiddenMask) { mask, index ->
+            mask and (1 shl index).inv()
+        })
+    override fun resetScrollStopHideOnOtherTabs() = true
+    override fun installBootstrapHooks(param: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam) {
+        if (param.processName == param.packageName) MeituanTakeoutSplash.bootstrap()
+    }
+    override fun onConfigurationReady(context: Context,
+        param: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam) {
+        if (param.processName == param.packageName) MeituanTakeoutSplash.install(context)
+    }
     override fun createNavigationState(context: Context) = MeituanTakeoutNavigationState()
+    override fun createNavigationState(context: Context, host: io.github.offlineglass.hook.GlassHostLayout) =
+        MeituanTakeoutNavigationState(host)
 
     override fun estimateSlotCount(group: ViewGroup, spec: TargetSpec): Int? {
-        if (group.javaClass.name != TITLE_INDICATOR) return null
-        val count = runCatching {
-            group.javaClass.getMethod("getTabCount").invoke(group) as? Int
-        }.getOrNull() ?: group.childCount
-        Log.i("WmGlassDiag", "estimateSlotCount: TitleIndicator getTabCount=$count childCount=${group.childCount}")
-        return if (count in spec.preferredSlots) count else 0
+        return MeituanTakeoutBinding.forRow(group)?.slots?.size
     }
 
     override fun findNavigation(root: View, spec: TargetSpec): NavigationCandidate? {
-        val navigation = AdapterNavigationSearch.findFirst(root) { view ->
-            view.javaClass.name == TITLE_INDICATOR &&
-                view.isAttachedToWindow && view.visibility == View.VISIBLE &&
-                view.width > 0 && view.height > 0
-        } ?: return null
-        val settled = estimateSlotCount(navigation, spec) ?: 0
-        Log.i("WmGlassDiag", "find: TitleIndicator settledSlots=$settled childCount=${navigation.childCount}")
-        if (settled < 2) return null
-        return NavigationCandidate(navigation, settled, 1_000)
+        val binding = MeituanTakeoutBinding.discover(root) ?: return null
+        return NavigationCandidate(binding.row, binding.slots.size, 1000)
     }
 
-    private const val TITLE_INDICATOR =
-        "com.sankuai.waimai.business.page.homepage.view.TitleIndicator"
 }

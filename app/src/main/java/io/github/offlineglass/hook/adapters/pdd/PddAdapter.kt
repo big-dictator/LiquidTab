@@ -9,12 +9,9 @@ internal object PddAdapter : TargetAdapter {
     override val key = "pdd"
     override val ownsNavigationDrawing = true
     override val usesCommittedSelection = true
-    override val usesOpticalSurfacePipeline = true
-    override val usesNativeOpticalBlur = true
-    override fun isOpticalSurfaceTab(selectedIndex: Int) = selectedIndex == PROMOTION_INDEX
-    override fun needsContinuousOpticalSurfaceFrames(selectedIndex: Int) = selectedIndex == PROMOTION_INDEX
+    override val updatesSceneDuringTapTransition = true
+    override val retainsExistingBackdropRenderNode = true
     override fun createNavigationState(context: Context): AppNavigationState = PddNavigationState()
-
-    private const val VIDEO_INDEX = 1
-    private const val PROMOTION_INDEX = 2
 }
+
+internal const val PDD_PROMOTION_INDEX = 2

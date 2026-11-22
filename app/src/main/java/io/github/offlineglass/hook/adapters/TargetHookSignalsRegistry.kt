@@ -7,7 +7,6 @@ internal object TargetHookSignalsRegistry {
         // Deferred adapters retain their existing signal providers unchanged.
         when (key) {
             "mi_file_manager" -> return io.github.offlineglass.hook.adapters.mi_file_manager.hookSignals()
-            "mi_gallery" -> return io.github.offlineglass.hook.adapters.mi_gallery.hookSignals()
             "mi_theme" -> return io.github.offlineglass.hook.adapters.mi_theme.hookSignals()
         }
         return io.github.offlineglass.targets.TargetSpecRegistry.all

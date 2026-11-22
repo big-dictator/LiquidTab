@@ -19,7 +19,6 @@ import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
     private lateinit var settingsState: MutableState<ManagerSettings>
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -36,14 +35,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (::settingsState.isInitialized) refresh()
+        if (BuildConfig.DEBUG) diagnosticActivity = java.lang.ref.WeakReference(this)
+        if (::settingsState.isInitialized) refresh(refreshInstalledPackages = true)
+        io.github.offlineglass.config.InstalledDouyinChannels.refresh(this) {
+            if (!isFinishing && !isDestroyed && ::settingsState.isInitialized) refresh()
+        }
+        io.github.offlineglass.hook.adapters.tiktok.TikTokInstalledTopChannels.refresh(this) {
+            if (!isFinishing && !isDestroyed && ::settingsState.isInitialized) refresh()
+        }
     }
 
     private fun actions() = UiActions(
+        setLanguage = { LocalSettings.setLanguage(this, it); refresh() },
         setUiMode = { LocalSettings.setUiMode(this, it); refresh() },
         setColorMode = { LocalSettings.setColorMode(this, it); refresh() },
         setDynamicColor = { LocalSettings.setDynamicColor(this, it); refresh() },
         setLiquidGlassEnabled = { LocalSettings.setLiquidGlassEnabled(this, it); refresh() },
+        setFrostedGlassEnabled = { LocalSettings.setFrostedGlassEnabled(this, it); refresh() },
 
         setSolidBarEnabled = { LocalSettings.setSolidBarEnabled(this, it); refresh() },
         setOutlineEnabled = { LocalSettings.setOutlineEnabled(this, it); refresh() },
@@ -75,8 +83,13 @@ class MainActivity : ComponentActivity() {
         },
     )
 
-    private fun refresh() {
-        settingsState.value = LocalSettings.snapshot(this)
+    private fun refresh(refreshInstalledPackages: Boolean = false) {
+        // Package visibility changes at resume, not at every slider commit.
+        // Reuse only installation metadata; always reload every setting and
+        // revision so target applications retain live configuration updates.
+        val installed = if (!refreshInstalledPackages && ::settingsState.isInitialized)
+            settingsState.value.installedPackages else null
+        settingsState.value = LocalSettings.snapshot(this, installed)
     }
 
     /**
@@ -115,6 +128,7 @@ class MainActivity : ComponentActivity() {
     }
 
     companion object {
+        internal var diagnosticActivity = java.lang.ref.WeakReference<MainActivity>(null)
         private val targetRestartExecutor = Executors.newSingleThreadExecutor { task ->
             Thread(task, "LiquidTab-AppSwitch").apply { isDaemon = true }
         }

@@ -8,6 +8,12 @@ import android.view.ViewGroup
 import android.widget.ImageView
 
 internal object WeiboAdapter : TargetAdapter {
+    override fun onConfigurationReady(context: Context, param: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam) {
+        WeiboMessageProbe.record(context, "configuration ready: native message binding + centered artwork build")
+        WeiboSplashHooks.install(context, param.classLoader)
+        WeiboMessageBinding.install()
+        WeiboHomeTopBinding.install()
+    }
     @Volatile internal var currentTab = 0
     @Volatile internal var lastNonVideoTab = 0
     override val key = "weibo"
@@ -15,14 +21,14 @@ internal object WeiboAdapter : TargetAdapter {
     override val forceCompositorFrames = true
     override val usesContentDarkMode = true
     override val disablePlatformForceDark = true
+    override fun glassSurfaceFillBlendMode(dark: Boolean) = weiboGlassFillBlendMode(dark)
     override val liveBackdropFramePump = true
     override val refreshOpticsOnBarShow = true
     override val releaseOutlineClipping = true
     override fun hiddenBarTranslationPx(hostHeight: Int, density: Float) =
         maxOf(hostHeight * .12f, 10f * density)
-    override fun scrollStopHideTab(selectedIndex: Int) = selectedIndex == 3
     override fun resetScrollStopHideOnOtherTabs() = true
-    override fun isBackPeekTab(selectedIndex: Int) = selectedIndex == 1 || selectedIndex == 3
+    override fun isBackPeekTab(selectedIndex: Int) = selectedIndex == 1
     override fun isBackPeekActivity(activity: android.app.Activity): Boolean =
         activity.javaClass.name in MAIN_ACTIVITIES
     override val backPeekDurationMs = 1_500L
@@ -77,3 +83,7 @@ internal object WeiboAdapter : TargetAdapter {
         "com.sina.weibo.SplashActivity",
     )
 }
+
+/** The dark tint attenuates the sampled scene, including on ColorOS. */
+internal fun weiboGlassFillBlendMode(dark: Boolean): android.graphics.BlendMode? =
+    if (dark) android.graphics.BlendMode.MULTIPLY else null

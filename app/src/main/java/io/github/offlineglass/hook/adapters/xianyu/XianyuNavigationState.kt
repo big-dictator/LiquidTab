@@ -4,7 +4,7 @@ import android.graphics.Canvas
 import android.graphics.RenderNode
 import android.widget.ImageView
 import android.widget.TextView
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XposedHelpers
 import android.os.SystemClock
 import android.os.Looper
 import android.view.View
@@ -32,6 +32,14 @@ internal class XianyuNavigationState(private val host: GlassHostLayout) : AppNav
     @Volatile private var artworkSignature = 0L
     private var recordedSignature = Long.MIN_VALUE
     private var recordedFrame: AdapterNavigationFrame? = null
+    private var restoreScenePending = false
+
+    override fun onHostWindowFocusChanged(hasFocus: Boolean) {
+        if (!hasFocus) restoreScenePending = true
+        else if (restoreScenePending) host.postInvalidateOnAnimation()
+    }
+
+    override fun onHostDetached() { restoreScenePending = true }
 
     override val allowsSoftwareBackdropCapture: Boolean get() = host.adapterSelectedIndex != 3
 
@@ -108,7 +116,23 @@ internal class XianyuNavigationState(private val host: GlassHostLayout) : AppNav
     }
 
     private fun drawArtwork(canvas: Canvas, frame: AdapterNavigationFrame) {
+        val detached = frame.barLayout?.takeIf { it.actionIndex == 2 }
+        if (detached != null && !frame.hideSelectedForOptics) {
+            val artwork = tabs.getOrNull(2)?.artwork
+            val camera = artwork?.let { root ->
+                arrayOf("post_ball_main_content", "post_ball_seafood_content", "post_ball_fun_content")
+                    .firstNotNullOfOrNull { id -> find(root, id)?.takeIf { it.visibility == View.VISIBLE } }
+            }
+            if (camera != null && camera.height > 0) {
+                val scale = 63.36f * frame.density / artwork.height.coerceAtLeast(1) *
+                    frame.iconScale * frame.extraScale * 1.3f
+                val cx = detached.actionLeft + detached.actionSize / 2f
+                drawView(canvas, camera, cx - camera.width * scale / 2f,
+                    frame.height / 2f - camera.height * scale / 2f, scale)
+            }
+        }
         for ((visual, index) in frame.enabledIndices.withIndex()) {
+            if (detached != null && index == 2) continue
             val tab = tabs.getOrNull(index) ?: continue
             val artwork = tab.artwork?.takeIf { it.width > 0 && it.height > 0 } ?: continue
             val animation = find(artwork, "tab_icon_animation")
@@ -149,7 +173,7 @@ internal class XianyuNavigationState(private val host: GlassHostLayout) : AppNav
                     drawPart(canvas, artwork, it, x, y - 3f * frame.density, scale)
                 }
             } else drawView(canvas, content, x - content.width * scale * .06f,
-                y - 3f * frame.density - content.height * scale * .06f, scale * 1.12f)
+                y - content.height * scale * .06f, scale * 1.12f)
             tab.badge?.takeIf { it.visibility == View.VISIBLE && it.width > 0 }?.let { badge ->
                 content.getLocationInWindow(origin)
                 badge.getLocationInWindow(position)
@@ -181,6 +205,20 @@ internal class XianyuNavigationState(private val host: GlassHostLayout) : AppNav
     }
 
     override fun onHostFrame(host: View) {
+        if (restoreScenePending && host.hasWindowFocus() && host.isAttachedToWindow) {
+            restoreScenePending = false
+            refreshAt = 0L
+            sampledTexture = null
+            sampledTimestamp = Long.MIN_VALUE
+            messageFrameChanged = true
+            recordedSignature = Long.MIN_VALUE
+            recordedFrame = null
+            navigationNode.discardDisplayList()
+            this.host.restoreOpticalSceneForAdapter()
+            this.host.postDelayed({
+                android.util.Log.i("LiquidTab-Xianyu", "resume optics ${this.host.adapterOpticalStateForDiagnostics}")
+            }, 250L)
+        }
         prepare(this.host.adapterNavigationSource) { _, _ -> }
         pageChrome.update()
         for (tab in tabs) tab.artwork?.let { find(it, "tab_icon_animation") }?.let {
@@ -190,8 +228,9 @@ internal class XianyuNavigationState(private val host: GlassHostLayout) : AppNav
         if (this.host.adapterSelectedIndex == 3) {
             val texture = pageChrome.messageFrameTexture()?.surfaceTexture
             val timestamp = texture?.let { runCatching { it.timestamp }.getOrNull() }
-            messageFrameChanged = texture !== sampledTexture || timestamp == null || timestamp <= 0L ||
-                timestamp != sampledTimestamp || frameWidth != host.width || frameHeight != host.height
+            messageFrameChanged = texture !== sampledTexture ||
+                (timestamp != null && timestamp > 0L && timestamp != sampledTimestamp) ||
+                frameWidth != host.width || frameHeight != host.height
             sampledTexture = texture
             sampledTimestamp = timestamp ?: Long.MIN_VALUE
             frameWidth = host.width

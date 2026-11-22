@@ -1,12 +1,16 @@
 package io.github.offlineglass.hook.adapters.tieba
 
 import android.app.Activity
+import android.util.TypedValue
+import android.widget.TextView
+import io.github.offlineglass.config.GlassConfig
+import io.github.offlineglass.hook.adapters.AdapterBarLayout
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 import io.github.offlineglass.hook.adapters.TargetAdapter
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import android.content.Context
@@ -16,8 +20,41 @@ import io.github.offlineglass.targets.TargetSpec
 /** Tieba-only native chrome and feed prompt hooks. */
 internal object TiebaAdapter : TargetAdapter {
     override val key = "tieba"
-    override val sourceTextSizeSp = 10f
+    const val TAB_ICON_SCALE = 1.15f
+    override val sourceIconScale = TAB_ICON_SCALE
+    override val sourceTextTranslationDp = -0.75f
+    override fun configureSourceText(view: TextView, config: GlassConfig, density: Float): Boolean {
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
+        return true
+    }
     override val projectedNavigationScale = 1.10f
+    override val foregroundNavigationOverSelection = true
+    override val ownsNavigationDrawing = true
+    override val usesNavigationOpticalMix = true
+    override val drawsNavigationInOptics = true
+    override val foregroundMaskInsetDp = 0f
+    override val suppressPlatformElevation = true
+    override val ownsNavigationSnapshotCapturePolicy = true
+    override fun barLayout(config: GlassConfig, width: Int, height: Int, density: Float, slots: Int): AdapterBarLayout? {
+        val gap = 12f * density
+        if (!config.detachedPublish || !config.isTiebaPublishVisible() || slots != 5 ||
+            height <= 0 || width <= height + gap) return null
+        val navigation = listOf(0, 1, 3, 4).filter { config.hiddenMask and (1 shl it) == 0 }
+        if (navigation.isEmpty()) return null
+        val actionLeft = (width - height).toFloat()
+        return AdapterBarLayout(
+            mainWidth = actionLeft - gap,
+            actionLeft = actionLeft,
+            actionSize = height.toFloat(),
+            actionIndex = 2,
+            navigationIndices = navigation,
+            actionFillColor = TIEBA_PUBLISH_BLUE,
+            actionHighlightScale = 0.35f,
+            localActionOptics = true,
+            localMainOptics = true,
+            actionFillUsesOnlySurfaceOpacity = true,
+        )
+    }
     override fun createNavigationState(context: Context, host: GlassHostLayout): AppNavigationState =
         TiebaNavigationState(host)
     private const val TIEBA_PACKAGE = "com.baidu.tieba"
@@ -27,8 +64,12 @@ internal object TiebaAdapter : TargetAdapter {
     override fun isBlockingOverlayActivity(activity: Activity) =
         activity.packageName == TIEBA_PACKAGE && activity.javaClass.name == SIDEBAR_ACTIVITY
 
-    override fun setBlockingOverlayVisible(visible: Boolean) { sidebarVisible = visible }
+    override fun setBlockingOverlayVisible(visible: Boolean) {
+        sidebarVisible = visible
+        TiebaTopBar.sidebarVisibilityChanged()
+    }
     override fun isBlockingOverlayVisible() = sidebarVisible
+    override fun beforeNavigationScan(activity: Activity) = TiebaTopBar.scan(activity)
 
     override fun prepareContentForInstall(content: ViewGroup) {
         if (android.os.Build.VERSION.SDK_INT < 21) return
@@ -47,6 +88,10 @@ internal object TiebaAdapter : TargetAdapter {
         }
     }
     override fun installHooks(lpparam: XC_LoadPackage.LoadPackageParam, spec: TargetSpec) {
+        TiebaTopBar.install(lpparam.classLoader)
+        TiebaFeedBottomInsets.install(lpparam.classLoader)
+        TiebaNativeTabAnimation.install(lpparam.classLoader)
+        TiebaSplashAds.install(lpparam.classLoader)
         installTiebaNavigationBarBgSuppression(lpparam)
         installTiebaFeedPromptSuppression(lpparam)
     }

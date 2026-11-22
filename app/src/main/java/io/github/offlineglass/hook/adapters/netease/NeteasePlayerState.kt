@@ -89,6 +89,7 @@ internal class NeteasePlayerState {
     val playerBitmapPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     val playerTitlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { isFakeBoldText = false }
     val playerStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+    val glassEdge = io.github.offlineglass.rendering.NativeGlassEdge()
     val bottomBarRect = RectF()
     val albumCirclePath = Path()
 }

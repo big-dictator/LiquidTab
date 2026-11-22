@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
+import io.github.offlineglass.hook.adapters.NavigationLabelLocalization
 
 /** Draw leaves directly: hidden native ancestors and their clipping cannot erase artwork. */
 internal object CainiaoArtworkCapture {
@@ -32,7 +33,7 @@ internal object CainiaoArtworkCapture {
         return result
     }
 
-    fun capture(source: ViewGroup, target: Bitmap): Boolean {
+    fun capture(source: ViewGroup, target: Bitmap, managerEnglishLabels: Boolean = false): Boolean {
         val all = descendants(source)
         val labels = all.filterIsInstance<TextView>().filter { it.resourceName() in labelIds }
         if (labels.size != 5) return false
@@ -74,7 +75,9 @@ internal object CainiaoArtworkCapture {
             canvas.save()
             canvas.clipRect(index * slotWidth, 0f, (index + 1) * slotWidth, target.height.toFloat())
             drawLeaf(canvas, icon, center, top, ENLARGEMENT)
-            drawLeaf(canvas, label, center, top + iconHeight + gap, ENLARGEMENT)
+            drawLabel(canvas, label, center, top + iconHeight + gap, ENLARGEMENT,
+                if (managerEnglishLabels) NavigationLabelLocalization.toEnglish("cainiao", label.text.toString())
+                else label.text.toString())
             // Badge size and colour stay native; anchor follows the enlarged icon's top/right.
             val newIconRight = center + icon.width * icon.scaleX * ENLARGEMENT / 2f
             val dx = newIconRight - (oldIcon[0] - origin[0] + icon.width * icon.scaleX)
@@ -99,6 +102,23 @@ internal object CainiaoArtworkCapture {
         val layer = canvas.saveLayerAlpha(0f, 0f, view.width.toFloat(), view.height.toFloat(),
             (view.alpha * 255).toInt().coerceIn(0, 255))
         view.draw(canvas)
+        canvas.restoreToCount(layer)
+        canvas.restore()
+    }
+
+    /** Draw only the displayed text variant; the native TextView and its click/accessibility owner stay untouched. */
+    private fun drawLabel(canvas: Canvas, view: TextView, centerX: Float, top: Float, scale: Float, text: String) {
+        if (view.alpha <= 0f || view.width <= 0 || view.height <= 0 || text.isEmpty()) return
+        val paint = android.text.TextPaint(view.paint).apply {
+            color = view.currentTextColor
+            textAlign = android.graphics.Paint.Align.CENTER
+        }
+        canvas.save()
+        canvas.translate(centerX - view.width * view.scaleX * scale / 2f, top)
+        canvas.scale(view.scaleX * scale, view.scaleY * scale)
+        val layer = canvas.saveLayerAlpha(0f, 0f, view.width.toFloat(), view.height.toFloat(),
+            (view.alpha * 255).toInt().coerceIn(0, 255))
+        canvas.drawText(text, view.width / 2f, view.baseline.toFloat(), paint)
         canvas.restoreToCount(layer)
         canvas.restore()
     }

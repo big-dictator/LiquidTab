@@ -12,6 +12,7 @@ import io.github.offlineglass.targets.TargetSpec
 // taps as synthesized MotionEvents dispatched onto the ComposeView.
 internal val targetSpec: TargetSpec = TargetSpec("bilibili_in", "com.bilibili.app.in", "哔哩哔哩国际版", AdapterSource.DEDICATED,
             activityHints = setOf("tv.danmaku.bili.MainActivityV2"),
+            uiProcessSuffixes = setOf("web"),
             idHints = setOf("tab_host"),
             classHints = setOf("MainActivityV2"),
             textHints = setOf("首页", "关注", "消息", "我的"),

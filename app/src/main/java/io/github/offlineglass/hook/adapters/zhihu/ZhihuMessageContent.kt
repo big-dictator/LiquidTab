@@ -4,9 +4,9 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.widget.ScrollView
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.hook.HookConfigReader
 import java.util.WeakHashMap
 
@@ -17,6 +17,13 @@ internal object ZhihuMessageContent {
         "com.zhihu.android.app.ui.fragment.notification.rn_message.OneMsgMainFragment")
     private val bound = WeakHashMap<View, Boolean>()
     fun install(loader: ClassLoader) {
+        val scrollType = runCatching {
+            XposedHelpers.findClass("com.facebook.react.views.scroll.ReactScrollViewManager", loader)
+                .declaredMethods.filter { it.name == "createViewInstance" &&
+                    it.parameterCount == 1 && android.content.Context::class.java.isAssignableFrom(it.parameterTypes[0]) &&
+                    ScrollView::class.java.isAssignableFrom(it.returnType) }
+                .map { it.returnType }.distinct().singleOrNull()
+        }.getOrNull() ?: return
         val owners = HashSet<Class<*>>()
         for (name in fragments) {
             var owner: Class<*>? = runCatching { XposedHelpers.findClass(name, loader) }.getOrNull()
@@ -28,7 +35,7 @@ internal object ZhihuMessageContent {
                     if (param.thisObject.javaClass.name !in fragments) return
                     val root = param.args.firstOrNull() as? ViewGroup ?: return
                     if (bound.put(root, true) != null) return
-                    val state = MessageViewport(root)
+                    val state = MessageViewport(root, scrollType)
                     root.addOnAttachStateChangeListener(state)
                     if (root.isAttachedToWindow) state.onViewAttachedToWindow(root)
                 }
@@ -37,7 +44,7 @@ internal object ZhihuMessageContent {
     }
 }
 
-private class MessageViewport(private val page: ViewGroup) : View.OnAttachStateChangeListener {
+private class MessageViewport(private val page: ViewGroup, private val scrollType: Class<*>) : View.OnAttachStateChangeListener {
     private data class Extension(val view: View, val previousBottom: Int, val extendedBottom: Int)
     private val changed = ArrayList<Extension>()
     private var observer: ViewTreeObserver? = null
@@ -69,8 +76,7 @@ private class MessageViewport(private val page: ViewGroup) : View.OnAttachStateC
         val scrolls = ArrayList<ScrollView>()
         fun collect(view: View, depth: Int) {
             if (depth > 6 || view.visibility != View.VISIBLE) return
-            // APK 11.10.0: ReactScrollViewManager.createViewInstance returns f.
-            if (view is ScrollView && view.javaClass.name == "com.facebook.react.views.scroll.f") {
+            if (view is ScrollView && scrollType.isInstance(view)) {
                 scrolls += view
                 return
             }

@@ -2,4 +2,5 @@
 -keep class io.github.offlineglass.hook.** { *; }
 -keep class io.github.offlineglass.config.SettingsProvider { *; }
 -keepattributes *Annotation*
--dontwarn de.robv.android.xposed.**
+-keep class io.github.offlineglass.hook.ModernHookEntry { public <init>(); *; }
+

@@ -3,81 +3,96 @@ package io.github.offlineglass.hook.adapters.jd
 import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
-import java.lang.ref.WeakReference
-import java.util.WeakHashMap
-import kotlin.math.abs
+import android.widget.FrameLayout
+import io.github.offlineglass.hook.GlassHostLayout
 
-/** Bounded discovery and same-frame positioning of JD's cart checkout strip. */
+/** Own the checkout only while its native controls are bound. */
 internal class JdCheckoutController(
     private val finder: JdChromeFinder,
     private val backToTop: JdBackToTopController,
+    private val isCartActive: () -> Boolean,
 ) {
-    var bar: WeakReference<View>? = null
-    var nextFindAt = 0L
-    var discoveryExhausted = false
-    var discoveryResetAt = 0L
-    private val offsets = WeakHashMap<View, Int>()
+    private val checkoutFinder = JdCheckoutBinding.Finder()
+    private var binding: JdCheckoutBinding? = null
+    private var sourceAlpha = 1f
+    private var liquid: JdCartLiquidButtons? = null
+    private var nextFindAt = 0L
+    private var visiblePage = -1
+    private var previewScene: View? = null
+
+    fun setPreviewScene(scene: View?) {
+        if (previewScene === scene) return
+        previewScene = scene
+        liquid?.invalidate()
+    }
+
+    fun onCartLayout(root: ViewGroup, host: View) {
+        backToTop.onNativeLayout()
+        lift(root, root.height, host)
+    }
+
+    fun syncPageVisibility(index: Int) {
+        if (visiblePage != index) {
+            visiblePage = index
+            if (index == 3) nextFindAt = 0L
+        }
+        liquid?.let {
+            val wanted = if (index == 3) View.VISIBLE else View.INVISIBLE
+            if (it.visibility != wanted) it.visibility = wanted
+        }
+    }
 
     fun onNavigationRebound() {
-        discoveryExhausted = false
+        releaseBinding()
         nextFindAt = 0L
     }
 
     fun lift(root: ViewGroup, rootHeight: Int, host: View) {
-        val rootWidth = root.width
-        if (rootWidth <= 0 || rootHeight <= 0) return
-        var current = bar?.get()
-        if (current == null || !current.isAttachedToWindow || current.parent == null) {
-            bar = null
-            if (discoveryExhausted) return
-            val now = SystemClock.uptimeMillis()
-            if (now < nextFindAt) return
-            current = finder.findCheckoutBar(root, rootWidth, rootHeight)
-            if (current != null) {
-                bar = WeakReference(current)
-                nextFindAt = 0L
-            } else {
-                discoveryExhausted = true
-                nextFindAt = Long.MAX_VALUE
-            }
-        }
-        if (current != null) correct(root, host)
+        if (root.width > 0 && rootHeight > 0) correct(root, host)
     }
 
     fun correct(root: ViewGroup?, host: View) {
-        val current = bar?.get()
-        if (current == null || !current.isAttachedToWindow || current.parent == null) {
-            bar = null
-            if (discoveryExhausted) {
-                val now = SystemClock.uptimeMillis()
-                if (now >= discoveryResetAt) {
-                    discoveryResetAt = now + 300L
-                    discoveryExhausted = false
-                    nextFindAt = 0L
-                }
+        val glass = host as? GlassHostLayout ?: return
+        if (!isCartActive() || root == null || glass.width <= 0 || glass.height <= 0) return
+        syncPageVisibility(3)
+        var current = binding
+        if (current == null || !current.isCurrent()) {
+            releaseBinding()
+            val now = SystemClock.uptimeMillis()
+            if (now < nextFindAt) return
+            nextFindAt = now + 120L
+            current = checkoutFinder.find(glass) ?: return
+            val parent = glass.parent as? FrameLayout ?: return
+            val overlay = JdCartLiquidButtons(glass.context, glass, current) {
+                previewScene ?: binding?.eventRoot?.takeIf { it.isAttachedToWindow && it.isShown }
             }
-            return
+            parent.addView(overlay, parent.indexOfChild(glass), FrameLayout.LayoutParams(-1,
+                (88f * parent.resources.displayMetrics.density).toInt()))
+            binding = current
+            sourceAlpha = current.shell.alpha
+            liquid = overlay
         }
-        val scene = root ?: return
-        if (scene.height <= 0 || host.width <= 0 || host.height <= 0) return
-        val hostLocation = IntArray(2).also(host::getLocationInWindow)
-        val safeBottom = hostLocation[1] - CHECKOUT_BOTTOM_GAP_PX
-        val barLocation = IntArray(2).also(current::getLocationInWindow)
-        val delta = barLocation[1] + current.height - safeBottom
-        if (abs(delta) > 6) {
-            current.offsetTopAndBottom(-delta)
-            offsets[current] = (offsets[current] ?: 0) - delta
+        if (current.shell.alpha != 0f) {
+            sourceAlpha = current.shell.alpha
+            current.shell.alpha = 0f
         }
-        backToTop.correct(current, scene, finder)
+        liquid?.let {
+            it.refresh()
+            backToTop.correct(current.shell, current.eventRoot, finder, it.capsuleTopInWindow())
+        }
+    }
+
+    private fun releaseBinding() {
+        liquid?.let { it.release(); (it.parent as? ViewGroup)?.removeView(it) }
+        liquid = null
+        binding?.shell?.let { if (it.alpha == 0f) it.alpha = sourceAlpha }
+        binding = null
     }
 
     fun restore() {
-        offsets.forEach { (view, applied) ->
-            if (applied != 0 && view.isAttachedToWindow) view.offsetTopAndBottom(-applied)
-        }
-        offsets.clear()
-        discoveryExhausted = false
+        previewScene = null
+        releaseBinding()
+        nextFindAt = 0L
+        visiblePage = -1
     }
-
-    private companion object { const val CHECKOUT_BOTTOM_GAP_PX = 8 }
 }

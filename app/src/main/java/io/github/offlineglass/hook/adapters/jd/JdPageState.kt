@@ -15,6 +15,10 @@ internal class JdPageState {
     var browseIdleTimerActive = false
         private set
     private var lastFullscreenVideoProbeAt = 0L
+    private val fullscreenViews = ArrayDeque<View>()
+    private val fullscreenDepths = ArrayDeque<Int>()
+    private val fullscreenLabelLocation = IntArray(2)
+    private var fullscreenProbeInProgress = false
     private var newProductsRenderer: WeakReference<View>? = null
     private var lastNewProductsProbeAt = 0L
     var newProductsActive = false
@@ -24,6 +28,13 @@ internal class JdPageState {
     @Volatile var tabSwitchUntil = 0L
 
     data class Probe(val active: Boolean, val changed: Boolean)
+
+    fun onNativeTabChanged(index: Int) {
+        fullscreenVideoActive = false
+        lastFullscreenVideoProbeAt = 0L
+        lastNewProductsProbeAt = 0L
+        if (index != 0) { newProductsActive = false; newProductsRenderer = null }
+    }
 
     fun probeNewProducts(root: ViewGroup, selectedIndex: Int, now: Long): Probe {
         if (selectedIndex != 0) {
@@ -67,8 +78,16 @@ internal class JdPageState {
         return Probe(newProductsActive, changed)
     }
 
-    fun probeFullscreenVideo(root: ViewGroup?, excludedSurface: View?): Probe {
+    fun probeFullscreenVideo(root: ViewGroup?, excludedSurface: View?, nativeIndex: Int = -1): Probe {
         val now = SystemClock.uptimeMillis()
+        // The contract describes Home/Browse channel tabs, not message/cart/
+        // profile widgets. Use the committed native index, never slider preview.
+        if (nativeIndex >= 2) {
+            val changed = fullscreenVideoActive
+            fullscreenVideoActive = false
+            return Probe(false, changed)
+        }
+        if (fullscreenProbeInProgress) return Probe(fullscreenVideoActive, false)
         if (now - lastFullscreenVideoProbeAt < 180L || root == null)
             return Probe(fullscreenVideoActive, false)
         lastFullscreenVideoProbeAt = now
@@ -79,10 +98,13 @@ internal class JdPageState {
         var hasSelectedVideoLabel = false
         var channelLabelCount = 0
         var visited = 0
-        val stack = ArrayDeque<Pair<View, Int>>()
-        stack += root to 0
-        while (stack.isNotEmpty() && visited++ < 1_600) {
-            val (view, depth) = stack.removeLast()
+        fullscreenProbeInProgress = true
+        fullscreenViews.addLast(root)
+        fullscreenDepths.addLast(0)
+        try {
+        while (fullscreenViews.isNotEmpty() && visited++ < 1_600) {
+            val view = fullscreenViews.removeLast()
+            val depth = fullscreenDepths.removeLast()
             if (view.visibility != View.VISIBLE || view.alpha <= 0.01f) continue
             if (view !== excludedSurface && (view is SurfaceView || view is TextureView) &&
                 view.width >= rootWidth * 0.72f && view.height >= rootHeight * 0.55f)
@@ -90,7 +112,7 @@ internal class JdPageState {
             if (view is TextView) {
                 val label = view.text?.toString()?.trim().orEmpty()
                 if (label in CHANNEL_LABELS) {
-                    val location = IntArray(2).also(view::getLocationInWindow)
+                    val location = fullscreenLabelLocation.also(view::getLocationInWindow)
                     if (location[1] + view.height <= rootHeight * 0.22f) {
                         channelLabelCount++
                         if (label == "视频") {
@@ -101,9 +123,20 @@ internal class JdPageState {
                     }
                 }
             }
+            if (hasLargeVideoSurface && hasTopVideoLabel && (hasSelectedVideoLabel || channelLabelCount >= 3)) break
             if (view is ViewGroup && depth < 18) {
-                for (index in 0 until view.childCount) stack += view.getChildAt(index) to depth + 1
+                for (index in 0 until view.childCount) {
+                    if (fullscreenViews.size >= 1_600) return Probe(fullscreenVideoActive, false)
+                    fullscreenViews.addLast(view.getChildAt(index))
+                    fullscreenDepths.addLast(depth + 1)
+                }
             }
+        }
+        } finally {
+            // Never retain an old page through the reusable traversal buffers.
+            fullscreenViews.clear()
+            fullscreenDepths.clear()
+            fullscreenProbeInProgress = false
         }
         val detected = hasLargeVideoSurface && hasTopVideoLabel &&
             (hasSelectedVideoLabel || channelLabelCount >= 3)

@@ -6,10 +6,10 @@ import android.view.ViewGroup
 import android.view.WindowInsets
 import android.widget.ImageView
 import android.widget.TextView
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 import io.github.offlineglass.hook.HookConfigReader
 import io.github.offlineglass.hook.NavigationCandidate
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
@@ -25,12 +25,22 @@ internal object MiHealthAdapter : TargetAdapter {
     override val key = "mi_health"
     override val ownsNavigationFinding = true
     override val ownsNavigationTap = true
+    override val ownsNavigationDrawing = true
+    override val foregroundNavigationOverSelection = true
+    override val drawsNavigationInOptics = true
+    override val usesNavigationOpticalMix = true
+    override val persistentNavigationOpticalMix = true
+    // Keep the artwork split aligned to the actual transformed inset lens.
+    override val foregroundUsesRenderedSelectionOutline = true
+    override val foregroundMaskInsetDp = 0f
     // The baseline commits selectionInitialized after Tab.select(). Without it,
     // the first dispatchDraw snaps the spring to the target and skips the tap animation.
     override val commitSelectionAfterTap = true
     // The glass host is the sole tab hit target, so its committed selection is
     // authoritative while TabLayout updates native selected flags.
     override val usesCommittedSelection = true
+    // Match WeChat's physical slider clearance on the same display.
+    override val indicatorInsetScale = 171f / 182f
     // The app briefly detaches/recreates main_tl_bottom during tab fragment
     // transitions. Keep the existing glass bar visible through that handoff
     // instead of playing a one-frame hide/show position animation.
@@ -42,16 +52,34 @@ internal object MiHealthAdapter : TargetAdapter {
 
     override fun configureSourceText(view: TextView, config: GlassConfig, density: Float): Boolean {
         view.textSize = config.textSize * CONTENT_SCALE
-        view.translationY = (SPACING_COMPENSATION_DP + GROUP_OFFSET_DP) * density
+        // main_view_tab uses a centered vertical chain. View scaling does not
+        // change that chain's layout bounds, so move the label by half the
+        // icon's added visual height: the gap and group center stay fixed.
+        val addedHalfHeight = if (resourceName(view) == "main_tv_tab_name") {
+            val group = view.parent as? ViewGroup
+            val icon = group?.let { parent ->
+                (0 until parent.childCount)
+                    .map { parent.getChildAt(it) }
+                    .firstOrNull { it is ImageView && resourceName(it) == "icon" } as? ImageView
+            }
+            val iconHeight = icon?.height?.coerceAtLeast(icon.measuredHeight) ?: 0
+            iconHeight * ICON_SCALE * config.iconScale * (ICON_ENLARGE - 1f) * 0.5f
+        } else 0f
+        view.translationY = (SPACING_COMPENSATION_DP + GROUP_OFFSET_DP) * density + addedHalfHeight
         return true
     }
 
     override fun configureSourceIcon(view: ImageView, config: GlassConfig, density: Float): Boolean {
-        view.scaleX = ICON_SCALE * config.iconScale
-        view.scaleY = ICON_SCALE * config.iconScale
+        val scale = ICON_SCALE * config.iconScale *
+            if (resourceName(view) == "icon") ICON_ENLARGE else 1f
+        view.scaleX = scale
+        view.scaleY = scale
         view.translationY = (-SPACING_COMPENSATION_DP + GROUP_OFFSET_DP) * density
         return true
     }
+
+    private fun resourceName(view: View): String? =
+        runCatching { view.resources.getResourceEntryName(view.id) }.getOrNull()
 
     override fun prepareNavigationSource(navigation: ViewGroup, density: Float) {
         val navigationName = runCatching { navigation.resources.getResourceEntryName(navigation.id) }.getOrNull()
@@ -115,6 +143,7 @@ internal object MiHealthAdapter : TargetAdapter {
 
     override fun installHooks(lpparam: XC_LoadPackage.LoadPackageParam, spec: TargetSpec) {
         installReactSafeAreaHook(lpparam, spec.packageName)
+        MiHealthBannerHooks.install(lpparam.classLoader, spec.packageName)
     }
 
     override fun findNavigation(root: View, spec: TargetSpec): NavigationCandidate? {
@@ -136,26 +165,45 @@ internal object MiHealthAdapter : TargetAdapter {
         lpparam: XC_LoadPackage.LoadPackageParam,
         packageName: String,
     ) {
-        val helperClass = runCatching {
-            XposedHelpers.findClass("x7n", lpparam.classLoader)
-        }.getOrNull() ?: run {
-            XposedBridge.log("[OfflineGlass][MiHealth] RN safe-area helper not found; skipping")
-            return
-        }
         runCatching {
-            XposedBridge.hookAllMethods(helperClass, "c", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val insets = param.result ?: return
-                    val view = param.args.firstOrNull() as? View ?: return
-                    val context = view.context ?: return
-                    if (!HookConfigReader.read(context, packageName).enabled) return
-                    zeroReactSafeAreaBottom(view, insets)
+            val provider = XposedHelpers.findClass("com.th3rdwave.safeareacontext.SafeAreaProvider", lpparam.classLoader)
+            val binding = MiHealthSafeAreaContract.resolve(provider)
+            val setter = binding.setter()
+            val callback = binding.callback()
+            val listenerType = setter.parameterTypes[0]
+            XposedBridge.hookMethod(setter, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val delegate = param.args[0] ?: return
+                    if (java.lang.reflect.Proxy.isProxyClass(delegate.javaClass)) return
+                    param.args[0] = java.lang.reflect.Proxy.newProxyInstance(lpparam.classLoader,
+                        arrayOf(listenerType)) { _, method, args ->
+                        val values = args?.clone()
+                        if (method == callback && values != null) {
+                            val view = values[0] as? View
+                            val insets = values[1]
+                            if (view != null && insets != null && HookConfigReader.read(view.context, packageName).enabled) {
+                                // Copy before editing: the provider caches the unmodified result for equality.
+                                val fields = insets.javaClass.declaredFields.filter {
+                                    it.type == Float::class.javaPrimitiveType && !java.lang.reflect.Modifier.isStatic(it.modifiers)
+                                }.onEach { it.isAccessible = true }
+                                val constructor = insets.javaClass.declaredConstructors.singleOrNull {
+                                    it.parameterTypes.size == 4 && it.parameterTypes.all { type -> type == Float::class.javaPrimitiveType }
+                                }
+                                if (fields.size == 4 && constructor != null) {
+                                    constructor.isAccessible = true
+                                    val copy = constructor.newInstance(0f, 0f, 0f, 0f)
+                                    fields.forEach { it.setFloat(copy, it.getFloat(insets)) }
+                                    zeroReactSafeAreaBottom(view, copy)
+                                    values[1] = copy
+                                }
+                            }
+                        }
+                        try { method.invoke(delegate, *(values ?: emptyArray())) }
+                        catch (error: java.lang.reflect.InvocationTargetException) { throw error.targetException }
+                    }
                 }
             })
-            XposedBridge.log("[OfflineGlass][MiHealth] RN safe-area bottom-zero hook installed")
-        }.onFailure {
-            XposedBridge.log("[OfflineGlass][MiHealth] RN safe-area hook failed: $it")
-        }
+        }.onFailure { XposedBridge.log("[OfflineGlass][MiHealth] safe-area contract unavailable: $it") }
     }
 
     private fun zeroReactSafeAreaBottom(view: View, insets: Any) {
@@ -190,6 +238,7 @@ internal object MiHealthAdapter : TargetAdapter {
 
     private const val CONTENT_SCALE = 1.10f
     private const val ICON_SCALE = 1.416f
+    private const val ICON_ENLARGE = 1.12f
     private const val SPACING_COMPENSATION_DP = 1.25f
     private const val GROUP_OFFSET_DP = 2f
 }

@@ -1,6 +1,6 @@
 package io.github.offlineglass.hook.adapters.youtube
 
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XposedBridge
 import android.content.Context
 import android.widget.ImageView
 import android.widget.TextView
@@ -13,10 +13,61 @@ import io.github.offlineglass.hook.adapters.TargetAdapter
 /** YouTube-specific navigation diagnostics, outside the generic finder. */
 internal object YouTubeAdapter : TargetAdapter {
     override val key = "youtube"
+    override val deferCompanionRemovalOnDetach = true
+    override val ownsNavigationFinding = true
+    override val recheckNavigationBindingOnLayout = true
+    override val ownsNavigationTap = true
+    private var pivotDiagnosticWritten = false
+
+    override fun findNavigation(root: android.view.View, spec: io.github.offlineglass.targets.TargetSpec): NavigationCandidate? {
+        val id = root.resources.getIdentifier("pivot_bar", "id", spec.packageName)
+        val source = if (id != 0) root.findViewById<android.view.ViewGroup>(id) else null
+        if (source == null || !source.isShown || source.width <= 0 || source.height <= 0) return null
+        val binding = YouTubePivotBinding.resolve(source)
+        if (io.github.offlineglass.BuildConfig.DEBUG && !pivotDiagnosticWritten && binding != null) {
+            pivotDiagnosticWritten = true
+            val roles = (0..4).filter { binding?.entry(it) != null }
+            val rows = (0 until source.childCount).mapNotNull { source.getChildAt(it) as? android.view.ViewGroup }
+                .take(4).map { row ->
+                    (0 until row.childCount.coerceAtMost(7)).map { i ->
+                        row.getChildAt(i).let { "${it.contentDescription} listener=${it.hasOnClickListeners()}" }
+                    }
+                }
+            source.post {
+                runCatching {
+                    java.io.File(source.context.getExternalFilesDir(null), "youtube_pivot_binding.txt")
+                        .writeText("semantic-pivot roles=$roles rows=$rows")
+                }
+            }
+        }
+        if (binding == null) {
+            android.util.Log.w("YouTubeGlassDiag", "Pivot row roles or native click targets could not be verified")
+            return null
+        }
+        // Host indices remain the settings indices even if the native row
+        // omits a role. Availability and dispatch use the verified cell map.
+        return NavigationCandidate(source, 5, 100)
+    }
+    override val supportsNativeEnglishLocale = true
+    override fun onConfigurationReady(context: Context, param: io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage.LoadPackageParam) {
+        YouTubeSpeedHaptics.install(context, param.classLoader)
+    }
+    override val accentColor = 0xFFFF0033.toInt()
     override val usesContentDarkMode = true
     override val hasPerFrameScene = true
+    // Page taps must not hold the previous page's pixels for the shared
+    // navigation-priority window. Existing single-flight sampling still applies.
+    override val keepsBackdropDuringTapTransition = true
     override val nativeNavigationDrawsInSourceSpace = true
     override val skipNavigationSnapshot = true
+    override val ownsNavigationDrawing = true
+    override val drawsNavigationInOptics = true
+    // Split the visible row at the moving lens boundary, then use the same
+    // selected/unselected artwork inside the lens source before refraction.
+    override val usesNavigationOpticalMix = true
+    override val foregroundNavigationOverSelection = true
+    override val foregroundUsesRenderedSelectionOutline = true
+    override val foregroundRequiresSubmittedIndicatorArtwork = true
     override val suppressPlatformElevation = true
     override val usesOpticalSurfacePipeline = true
     override val usesDirectOpticalBackdropMode = true
@@ -25,11 +76,31 @@ internal object YouTubeAdapter : TargetAdapter {
     override val keepsOpticalSurfaceDuringBarAnimation = true
     override val opticalSurfaceFollowsBarTransform = false
     override val allowsSystemBackgroundBlur = false
-    override val reuseOpticalBlur = true
-    override val reuseSurfaceBlurDuringBarAnimation = true
+    // Use the shared NativeBackdropBlur -> refraction chain directly. Do not
+    // insert a YouTube-owned preblur node or retain its effect across settings.
     // A changing backdrop callback and the UI animation pump otherwise
     // submit the same optical Surface twice during one animation frame.
     override val deferOpticalRenderDuringBarAnimation = true
+
+    override fun barLayout(
+        config: GlassConfig, width: Int, height: Int, density: Float, slots: Int,
+    ): io.github.offlineglass.hook.adapters.AdapterBarLayout? {
+        if (!config.detachedPublish || !config.isYouTubeCreateVisible() || slots != 5 ||
+            width <= height || height <= 0
+        ) return null
+        val gap = 12f * density
+        val actionLeft = width - height.toFloat()
+        return io.github.offlineglass.hook.adapters.AdapterBarLayout(
+            mainWidth = (actionLeft - gap).coerceAtLeast(height.toFloat()),
+            actionLeft = actionLeft,
+            actionSize = height.toFloat(),
+            actionIndex = 2,
+            navigationIndices = listOf(0, 1, 3, 4).filter { config.hiddenMask and (1 shl it) == 0 },
+            actionFillColor = accentColor,
+            localActionOptics = true,
+            localMainOptics = true,
+        )
+    }
 
     override fun opticalSurfaceLayout(
         contentWidth: Int, contentHeight: Int, hostLeft: Int, hostTop: Int,
@@ -49,8 +120,10 @@ internal object YouTubeAdapter : TargetAdapter {
             (top - padding).coerceAtLeast(0), (left + width + padding).coerceAtMost(rootWidth),
             (top + height + padding).coerceAtMost(rootHeight))
         if (rect.isEmpty) return null
-        val w = (rect.width() / 3).coerceAtLeast(1)
-        val h = (rect.height() / 3).coerceAtLeast(1)
+        // Preserve the source pixels. Downsampling and stretching introduces
+        // softness even at a configured radius of zero, before the shared blur.
+        val w = rect.width()
+        val h = rect.height()
         return io.github.offlineglass.hook.adapters.OpticalCaptureGeometry(rect, w, h,
             android.graphics.Rect(0, 0, w, h))
     }

@@ -4,8 +4,8 @@ import android.graphics.Insets
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
 import java.util.WeakHashMap
 
 /** Strip only navigation fitting on the decor windows managed by this adapter. */

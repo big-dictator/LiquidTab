@@ -12,6 +12,8 @@ import android.graphics.RectF
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.RelativeLayout
 import android.widget.TextView
 import android.os.SystemClock
 import io.github.offlineglass.hook.GlassHostLayout
@@ -26,25 +28,93 @@ internal class PddNavigationState : AppNavigationState {
     private val itemPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val staticItems = arrayOfNulls<Bitmap>(5)
     private val badgeItems = arrayOfNulls<Bitmap>(5)
+    private val iconBounds = arrayOfNulls<Rect>(5)
+    private var artworkPixels = IntArray(0)
     private var activeHost: GlassHostLayout? = null
     private var selectedIndex = 0
-    private var lastOpticalSelection = -1
+    private var shell: NativeShell? = null
+    private var lastShellProbe = 0L
+    private var reportedShellMismatch = false
     private var mainContent: View? = null
-    private var originalMainHeight = 0
-    private var originalMainBottomMargin = 0
-    private var nativeInsetRemoved = false
+    private var originalMainBottomMargin: Int? = null
+    private var originalMainHeight: Int? = null
+    private val promotionBackdrop = PddPromotionBackdrop()
+    private val transitionOptics = PddTransitionOptics()
+    private var promotionHandoffUntil = 0L
+    private var leavingPromotion = false
     private val topActionBaseTranslations = java.util.WeakHashMap<View, Float>()
     private var topActionTarget: View? = null
     private var lastTopActionProbe = 0L
 
     override fun onHostFrame(host: View) {
-        activeHost = host as? GlassHostLayout
-        selectedIndex = activeHost?.adapterResolvedSelection()?.coerceIn(0, 4) ?: selectedIndex
-        if (lastOpticalSelection == PROMOTION_INDEX && selectedIndex != PROMOTION_INDEX) {
-            activeHost?.updateOpticalSurfacePipeline(false)
-            activeHost?.invalidateOpticalBackdropForAdapter()
+        val glassHost = host as? GlassHostLayout ?: return
+        activeHost = glassHost
+        val next = glassHost.adapterResolvedSelection() ?: selectedIndex
+        if (next != selectedIndex && next != PDD_PROMOTION_INDEX) transitionOptics.clear()
+        if (next != selectedIndex && (next == PDD_PROMOTION_INDEX || selectedIndex == PDD_PROMOTION_INDEX)) {
+            leavingPromotion = next != PDD_PROMOTION_INDEX
+            val handoffMillis = if (leavingPromotion) PROMOTION_HANDOFF_MS else PROMOTION_ENTRY_MS
+            val deadline = SystemClock.uptimeMillis() + handoffMillis
+            promotionHandoffUntil = deadline
+            glassHost.postDelayed({
+                if (promotionHandoffUntil == deadline && glassHost.isAttachedToWindow) {
+                    glassHost.postInvalidateOnAnimation()
+                }
+            }, handoffMillis)
         }
-        lastOpticalSelection = selectedIndex
+        selectedIndex = next
+        suppressNativeChrome(glassHost.adapterNavigationSource)
+        if (selectedIndex == PDD_PROMOTION_INDEX) {
+            promotionBackdrop.update(glassHost, mainContent)
+            if (promotionBackdrop.scene() != null) transitionOptics.clear()
+        } else if (leavingPromotion && !promotionBackdrop.isSourceVisible() &&
+            SystemClock.uptimeMillis() >= promotionHandoffUntil
+        ) {
+            leavingPromotion = false
+            promotionBackdrop.release()
+        }
+        if (selectedIndex != PDD_PROMOTION_INDEX && !leavingPromotion) {
+            transitionOptics.prepare(glassHost) { selectedIndex == next && !leavingPromotion }
+        }
+    }
+
+    override val allowsSoftwareBackdropCapture: Boolean
+        get() = selectedIndex != PDD_PROMOTION_INDEX && !leavingPromotion
+
+    override fun retainBackdropDuringTransition(now: Long): Boolean =
+        now < promotionHandoffUntil && when {
+            selectedIndex == PDD_PROMOTION_INDEX ->
+                promotionBackdrop.scene() == null && transitionStrip() == null
+            leavingPromotion -> promotionBackdrop.isSourceVisible()
+            else -> false
+        }
+
+    override val suppliesRetainedNavigationBackdrop: Boolean
+        get() = selectedIndex == PDD_PROMOTION_INDEX ||
+            (leavingPromotion && promotionBackdrop.isSourceVisible())
+
+    override fun retainedNavigationBackdrop() = promotionBackdrop.retainedScene() ?: transitionStrip()
+
+    private fun transitionStrip() = activeHost?.takeIf {
+        selectedIndex == PDD_PROMOTION_INDEX && SystemClock.uptimeMillis() < promotionHandoffUntil
+    }?.let(transitionOptics::backdrop)
+
+    override fun onLiveBackdropRecorded(selectedIndex: Int) {
+        if (!leavingPromotion || selectedIndex == PDD_PROMOTION_INDEX ||
+            promotionBackdrop.isSourceVisible()) return
+        // The host has replaced its scene with the destination. Only now
+        // release the old WebView layer without clearing the destination.
+        leavingPromotion = false
+        promotionHandoffUntil = 0L
+        promotionBackdrop.release(sceneReplaced = true)
+    }
+
+    override fun onHostDetached() {
+        transitionOptics.clear()
+        leavingPromotion = false
+        promotionHandoffUntil = 0L
+        promotionBackdrop.release()
+        restoreContentInset()
     }
 
     override fun retainNavigationWhenNativeRowHidden(selectedIndex: Int): Boolean =
@@ -52,51 +122,115 @@ internal class PddNavigationState : AppNavigationState {
 
     override fun suppressNativeChrome(source: ViewGroup?) {
         val host = activeHost ?: return
-        selectedIndex = host.adapterResolvedSelection()?.coerceIn(0, 4) ?: selectedIndex
-        if (source == null || !source.javaClass.name.endsWith(".PddTabView")) return
-        source.alpha = 0f
-        source.background = null
-        source.backgroundTintList = null
-        source.foreground = null
-        val frame = source.parent as? ViewGroup ?: return
-        if (!frame.javaClass.name.endsWith(".MainFrameContainerView")) return
-        mainContent?.takeIf { !it.isAttachedToWindow || it.parent !== frame }?.let {
-            mainContent = null; originalMainHeight = 0; originalMainBottomMargin = 0; nativeInsetRemoved = false
-        }
-        val density = host.resources.displayMetrics.density
-        for (index in 0 until frame.childCount) {
-            val sibling = frame.getChildAt(index)
-            if (sibling === source || sibling === host) continue
-            val fullWidth = sibling.width >= frame.width * .95f
-            val divider = sibling.javaClass == View::class.java && fullWidth &&
-                sibling.height in 1..(2f * density).roundToInt().coerceAtLeast(1) &&
-                sibling.top in (source.top - sibling.height)..source.bottom
-            if (divider && sibling.alpha != 0f) sibling.alpha = 0f
-            if (sibling is FrameLayout && fullWidth && sibling.height >= frame.height * .70f && mainContent == null) {
-                mainContent = sibling
-                sibling.layoutParams.let { lp ->
-                    if (lp.height > 0) originalMainHeight = lp.height
-                    originalMainBottomMargin = (lp as? ViewGroup.MarginLayoutParams)?.bottomMargin ?: 0
+        if (source !== host.adapterNavigationSource) return
+        val existing = shell
+        val binding = if (existing != null && existing.matches(source)) existing else {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastShellProbe < SHELL_PROBE_MS) return
+            lastShellProbe = now
+            restoreContentInset()
+            bindNativeShell(source).also {
+                shell = it
+                mainContent = it?.content
+                if (existing?.content !== it?.content) host.invalidateOpticalBackdropForAdapter()
+                if (it == null && !reportedShellMismatch && selectedIndex == PDD_PROMOTION_INDEX) {
+                    reportedShellMismatch = true
+                    val frame = source?.parent as? ViewGroup
+                    android.util.Log.w("LiquidTabPdd", "Promotion shell did not match: tabs=${source?.childCount}" +
+                        " frame=${frame?.javaClass?.simpleName} children=" +
+                        (0 until (frame?.childCount ?: 0)).joinToString { index ->
+                            val child = frame?.getChildAt(index)
+                            val params = child?.layoutParams as? RelativeLayout.LayoutParams
+                            "${child?.javaClass?.simpleName}(w=${params?.width},h=${params?.height}," +
+                                "margin=${params?.bottomMargin},rules=${params?.rules?.contentToString()})"
+                        })
                 }
             }
+        } ?: return
+        if (binding.tabs.alpha != 0f) binding.tabs.alpha = 0f
+        if (binding.tabs.backgroundTintList != null) binding.tabs.backgroundTintList = null
+        if (binding.tabs.background != null) binding.tabs.background = null
+        if (binding.tabs.foreground != null) binding.tabs.foreground = null
+        binding.divider?.let { if (it.alpha != 0f) it.alpha = 0f }
+
+        // The native tab row is hidden for the entire lifetime of this binding.
+        // Its reserved space would expose the frame background under the floating bar.
+        val params = binding.content.layoutParams as? RelativeLayout.LayoutParams ?: return
+        val needsHeight = params.height != ViewGroup.LayoutParams.MATCH_PARENT
+        if (params.bottomMargin > 0 || needsHeight) {
+            if (params.bottomMargin > 0) {
+                originalMainBottomMargin = params.bottomMargin
+                params.bottomMargin = 0
+            }
+            if (needsHeight) {
+                originalMainHeight = params.height
+                params.height = ViewGroup.LayoutParams.MATCH_PARENT
+            }
+            binding.content.layoutParams = params
         }
-        val content = mainContent ?: return
-        val params = content.layoutParams
-        val removeInset = selectedIndex == CHAT_INDEX || selectedIndex == PROMOTION_INDEX
-        if (removeInset && !nativeInsetRemoved) {
-            if (originalMainHeight <= 0 && params.height > 0) originalMainHeight = params.height
-            params.height = ViewGroup.LayoutParams.MATCH_PARENT
-            if (params is ViewGroup.MarginLayoutParams) params.bottomMargin = 0
-            content.layoutParams = params; content.requestLayout(); frame.requestLayout(); nativeInsetRemoved = true
-        } else if (!removeInset && nativeInsetRemoved) {
-            if (originalMainHeight > 0) params.height = originalMainHeight
-            if (params is ViewGroup.MarginLayoutParams) params.bottomMargin = originalMainBottomMargin
-            content.layoutParams = params; content.requestLayout(); frame.requestLayout(); nativeInsetRemoved = false
-        }
-        host.updateOpticalSurfacePipeline(selectedIndex == PROMOTION_INDEX)
     }
 
-    override fun resolveBackdropScene(host: View): View? = mainContent
+    private fun restoreContentInset() {
+        val margin = originalMainBottomMargin
+        val height = originalMainHeight
+        if (margin == null && height == null) return
+        originalMainBottomMargin = null
+        originalMainHeight = null
+        val content = mainContent ?: return
+        val params = content.layoutParams as? RelativeLayout.LayoutParams ?: return
+        if (margin != null && params.bottomMargin == 0) params.bottomMargin = margin
+        if (height != null && params.height == ViewGroup.LayoutParams.MATCH_PARENT) params.height = height
+        content.layoutParams = params
+    }
+
+    private data class NativeShell(
+        val frame: RelativeLayout,
+        val tabs: ViewGroup,
+        val content: FrameLayout,
+        val divider: View?,
+        val childCount: Int,
+    ) {
+        fun matches(source: ViewGroup?): Boolean =
+            source === tabs && tabs.parent === frame && frame.childCount == childCount &&
+                content.parent === frame && (divider == null || divider.parent === frame)
+    }
+
+    private fun bindNativeShell(source: ViewGroup?): NativeShell? {
+        val tabs = source as? LinearLayout ?: return null
+        val frame = tabs.parent as? RelativeLayout ?: return null
+        val tabParams = tabs.layoutParams as? RelativeLayout.LayoutParams ?: return null
+        if (tabs.orientation != LinearLayout.HORIZONTAL || tabs.childCount != 5 ||
+            tabParams.width != ViewGroup.LayoutParams.MATCH_PARENT || tabParams.height <= 0 ||
+            tabParams.getRule(RelativeLayout.ALIGN_PARENT_BOTTOM) == 0
+        ) return null
+
+        var divider: View? = null
+        var content: FrameLayout? = null
+        for (index in 0 until frame.childCount) {
+            val child = frame.getChildAt(index)
+            val params = child.layoutParams as? RelativeLayout.LayoutParams ?: continue
+            if (params.width != ViewGroup.LayoutParams.MATCH_PARENT) continue
+            if (child.javaClass == View::class.java && params.height == 1 &&
+                params.getRule(RelativeLayout.ALIGN_PARENT_BOTTOM) != 0 &&
+                params.bottomMargin in 1..tabParams.height
+            ) {
+                if (divider != null) return null
+                divider = child
+            }
+            if (child is FrameLayout &&
+                (params.height == ViewGroup.LayoutParams.MATCH_PARENT || child.height >= frame.height * .70f) &&
+                params.getRule(RelativeLayout.ALIGN_PARENT_TOP) != 0
+            ) {
+                if (content != null) return null
+                content = child
+            }
+        }
+        val scene = content ?: return null
+        return NativeShell(frame, tabs, scene, divider, frame.childCount)
+    }
+
+    override fun resolveBackdropScene(host: View): View? =
+        if (selectedIndex == PDD_PROMOTION_INDEX) promotionBackdrop.scene() else mainContent
 
     override fun enforceContentClipping() {
         (mainContent as? ViewGroup)?.let { it.clipChildren = true; it.clipToPadding = true }
@@ -177,6 +311,7 @@ internal class PddNavigationState : AppNavigationState {
             badgeItems[index]?.takeUnless(Bitmap::isRecycled)?.recycle()
             staticItems[index] = item
             badgeItems[index] = badge
+            iconBounds[index] = findIconBand(item, source.resources.displayMetrics.density)
             raw.recycle()
         }
         Canvas(target).drawColor(Color.TRANSPARENT, BlendMode.CLEAR)
@@ -196,13 +331,21 @@ internal class PddNavigationState : AppNavigationState {
             val drawWidth = bitmap.width * scale
             val drawHeight = bitmap.height * scale
             val centerX = horizontalPadding + (visualIndex + .5f) * frame.slotWidth
-            val centerY = frame.height / 2f
+            val icon = iconBounds[index].takeIf { frame.iconOnly }
+            val centerY = frame.height / 2f + (icon?.let { bitmap.height / 2f - it.exactCenterY() } ?: 0f) * scale
             val destination = RectF(centerX - drawWidth / 2f, centerY - drawHeight / 2f,
                 centerX + drawWidth / 2f, centerY + drawHeight / 2f)
             itemPaint.colorFilter = if (index == frame.selectedIndex) null
                 else BlendModeColorFilter(color, BlendMode.SRC_IN)
             itemPaint.alpha = if (index == frame.selectedIndex) 255 else 248
-            canvas.drawBitmap(bitmap, null, destination, itemPaint)
+            if (icon == null) {
+                canvas.drawBitmap(bitmap, null, destination, itemPaint)
+            } else {
+                val iconDestination = RectF(destination.left + icon.left * scale,
+                    destination.top + icon.top * scale, destination.left + icon.right * scale,
+                    destination.top + icon.bottom * scale)
+                canvas.drawBitmap(bitmap, icon, iconDestination, itemPaint)
+            }
             badgeItems[index]?.takeUnless(Bitmap::isRecycled)?.let {
                 itemPaint.colorFilter = null
                 itemPaint.alpha = 255
@@ -214,10 +357,15 @@ internal class PddNavigationState : AppNavigationState {
     }
 
     override fun dispose() {
+        transitionOptics.clear()
         staticItems.forEachIndexed { index, bitmap -> bitmap?.takeUnless(Bitmap::isRecycled)?.recycle(); staticItems[index] = null }
         badgeItems.forEachIndexed { index, bitmap -> bitmap?.takeUnless(Bitmap::isRecycled)?.recycle(); badgeItems[index] = null }
+        iconBounds.fill(null)
+        artworkPixels = IntArray(0)
+        promotionBackdrop.release()
         activeHost = null
-        lastOpticalSelection = -1
+        restoreContentInset()
+        shell = null
         topActionBaseTranslations.forEach { (view, base) -> view.translationY = base }
         topActionBaseTranslations.clear(); topActionTarget = null; mainContent = null
     }
@@ -240,6 +388,24 @@ internal class PddNavigationState : AppNavigationState {
             val x = i % bitmap.width; val y = i / bitmap.width
             left = min(left, x); top = min(top, y); right = max(right, x); bottom = max(bottom, y)
         } }
+        return if (right >= left && bottom >= top) Rect(left, top, right + 1, bottom + 1) else null
+    }
+
+    /** Resolve the two artwork bands in the already-bound native slot, after
+     * badge separation. Reject ambiguous or single-band images unchanged. */
+    private fun findIconBand(item: Bitmap, density: Float): Rect? {
+        val w = item.width
+        val h = item.height
+        if (artworkPixels.size < w * h) artworkPixels = IntArray(w * h)
+        item.getPixels(artworkPixels, 0, w, 0, 0, w, h)
+        val split = PddTabArtworkBands.iconEnd(artworkPixels, w, h, density)
+        if (split <= 0) return null
+        var left = w; var right = -1; var top = split; var bottom = -1
+        for (y in 0 until split) for (x in 0 until w) {
+            if (Color.alpha(artworkPixels[y * w + x]) <= 24) continue
+            left = min(left, x); right = max(right, x)
+            top = min(top, y); bottom = max(bottom, y)
+        }
         return if (right >= left && bottom >= top) Rect(left, top, right + 1, bottom + 1) else null
     }
 
@@ -278,8 +444,10 @@ internal class PddNavigationState : AppNavigationState {
     private companion object {
         const val HOME_INDEX = 0
         const val CHAT_INDEX = 3
-        const val PROMOTION_INDEX = 2
         const val CONTENT_SCALE = .80f
         const val TOP_ACTION_PROBE_MS = 120L
+        const val SHELL_PROBE_MS = 160L
+        const val PROMOTION_HANDOFF_MS = 420L
+        const val PROMOTION_ENTRY_MS = 1_200L
     }
 }

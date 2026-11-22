@@ -5,30 +5,34 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.view.View
 import android.view.ViewGroup
-import android.widget.ImageView
-import android.widget.TextView
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
+import io.github.offlineglass.hook.compat.XposedHelpers
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
-import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.adapters.localizeNavigationLabel
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-/** Per-renderer state; both panels share optics, never app-specific resources or input. */
+/**
+ * Per-renderer state. Selection is resolved by item identity (the semantic
+ * getItem/getSelectedItem accessors return the same instance for the selected
+ * cell) and artwork is read from each cell's own view tree — never from the
+ * obfuscated holder accessors that QQMusic renames between builds.
+ */
 internal class QqMusicNavigationState(private val host: GlassHostLayout) : AppNavigationState {
-    private val isPlayer get() = AdapterNavigationSearch.resourceEntryName(host.adapterNavigationSource ?: host) == "g5x"
+    private val isPlayer get() = QqMusicBinding.isPlayerRoot(host.adapterNavigationSource ?: host)
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
     private val labelBounds = Rect()
-    private val holders = HashMap<View, Artwork>()
+    private val holders = HashMap<View, QqMusicBinding.Artwork>()
+    private val nativeIcons = HashMap<View, QqMusicBinding.NativeIconPair>()
+    private var artworkStamp = 0
     private var lastCells: List<View> = emptyList()
-    private var reflectionFailureLogged = false
     private val contentInsets = QqMusicContentInsets()
     private val sceneLocation = IntArray(2)
     private val hostLocation = IntArray(2)
     private var recordedScene: java.lang.ref.WeakReference<View>? = null
     private var recordedGeometry = Long.MIN_VALUE
+    private var recordedPage = -1
     private var videoScrollHideActive = false
 
     private fun sceneGeometry(scene: View): Long {
@@ -48,19 +52,16 @@ internal class QqMusicNavigationState(private val host: GlassHostLayout) : AppNa
     // display lists normally; scrolling pixels stay live without a second sweep.
     override fun retainHomeBackdrop(selectedIndex: Int): Boolean {
         val scene = resolveBackdropScene(host) ?: return false
-        return recordedScene?.get() === scene && recordedGeometry == sceneGeometry(scene)
+        return recordedPage == selectedIndex && recordedScene?.get() === scene &&
+            recordedGeometry == sceneGeometry(scene)
     }
 
     override fun onLiveBackdropRecorded(selectedIndex: Int) {
         val scene = resolveBackdropScene(host) ?: return
         recordedScene = java.lang.ref.WeakReference(scene)
         recordedGeometry = sceneGeometry(scene)
+        recordedPage = selectedIndex
     }
-
-    private data class Artwork(
-        val image: ImageView?, val alternateImage: ImageView?, val text: TextView?,
-        val badges: List<View>,
-    )
 
     override fun allowsHostTouch() = !isPlayer
     override val allowsSoftwareBackdropCapture = false
@@ -68,44 +69,56 @@ internal class QqMusicNavigationState(private val host: GlassHostLayout) : AppNa
     override fun suppressRedrawnSource() = !isPlayer
     // Keep the blurred backdrop layer that gives the moving pill its glass optics,
     // while excluding the hidden native row that caused blue icon ghosts.
-    override fun drawHiddenTabsInIndicatorScene(hybridBackdrop: Boolean) = !hybridBackdrop
-    override fun includeNavigationInIndicatorScene(surfaceActive: Boolean) = false
+    override fun drawHiddenTabsInIndicatorScene(hybridBackdrop: Boolean) = !isPlayer
+    override fun includeNavigationInIndicatorScene(surfaceActive: Boolean) = !isPlayer
+    private var foregroundIdle = false
+
+    override fun drawForeground(canvas: Canvas, frame: AdapterNavigationFrame,
+        selectionPath: android.graphics.Path, drawSource: () -> Unit): Boolean {
+        if (isPlayer) return false
+        val save = canvas.save()
+        canvas.clipOutPath(selectionPath)
+        foregroundIdle = true
+        try { draw(canvas, frame) } finally {
+            foregroundIdle = false
+            canvas.restoreToCount(save)
+        }
+        return true
+    }
+
     override fun resolveSelectedIndex(source: ViewGroup?, slotCount: Int): Int? {
         if (isPlayer) return 0
         source ?: return null
         return runCatching {
-            val item = XposedHelpers.callMethod(source, "getSelectedItem") ?: return@runCatching null
-            val holder = XposedHelpers.callMethod(item, "h") ?: return@runCatching null
-            val root = XposedHelpers.callMethod(holder, "m") as? View ?: return@runCatching null
-            cells(source).indexOf(root).takeIf { it in 0 until slotCount }
+            val selected = XposedHelpers.callMethod(source, "getSelectedItem") ?: return@runCatching null
+            cells(source).indexOfFirst { cell ->
+                XposedHelpers.callMethod(source, "getItem", cell.tag as Int) === selected
+            }.takeIf { it in 0 until slotCount }
         }.getOrNull()
     }
 
     override fun prepare(source: ViewGroup?, schedule: (Long, () -> Unit) -> Unit) {
         if (isPlayer || source == null) return
         val current = cells(source)
-        if (current == lastCells) return
+        val stamp = holders.values.fold(host.resources.configuration.hashCode()) { hash, art ->
+            art.icons.fold(hash) { value, icon -> 31 * value + System.identityHashCode(icon.drawable) }
+        }
+        if (current == lastCells && stamp == artworkStamp) return
         holders.clear()
         lastCells = current
-        for (cell in current) runCatching {
-            val item = XposedHelpers.callMethod(source, "getItem", cell.tag as Int) ?: return@runCatching
-            val holder = XposedHelpers.callMethod(item, "h") ?: return@runCatching
-            fun view(method: String) = XposedHelpers.callMethod(holder, method) as? View
-            holders[cell] = Artwork(
-                view("f") as? ImageView, view("b") as? ImageView, view("l") as? TextView,
-                listOfNotNull(view("h"), view("i"), view("a")),
-            )
-        }.onFailure {
-            if (!reflectionFailureLogged) {
-                reflectionFailureLogged = true
-                XposedBridge.log("[OfflineGlass][QQMusic] native artwork binding failed: $it")
-            }
+        nativeIcons.clear()
+        for (cell in current) {
+            holders[cell] = QqMusicBinding.extractArtwork(cell)
+            QqMusicBinding.nativeIconPair(source, cell)?.let { nativeIcons[cell] = it }
+        }
+        artworkStamp = holders.values.fold(host.resources.configuration.hashCode()) { hash, art ->
+            art.icons.fold(hash) { value, icon -> 31 * value + System.identityHashCode(icon.drawable) }
         }
     }
 
     override fun onHostPreDraw(
         host: View, source: ViewGroup?, selected: () -> Int, enabled: Boolean,
-         density: Float, barHeightPx: Int,
+        density: Float, barHeightPx: Int,
         surfaceColor: () -> Int,
     ) {
         if (isPlayer) {
@@ -172,6 +185,7 @@ internal class QqMusicNavigationState(private val host: GlassHostLayout) : AppNa
         this.host.postInvalidateOnAnimation()
         return true
     }
+
     override fun forceNavigationBarImmersed(host: GlassHostLayout): Boolean {
         // Both renderer listeners use one page decision, so a hidden navigation
         // panel cannot restore an inset while a sub-page still displays its player.
@@ -195,31 +209,52 @@ internal class QqMusicNavigationState(private val host: GlassHostLayout) : AppNa
         val hasLabel = !frame.iconOnly
         val labelGap = 2f * frame.density
         val totalHeight = iconSize + if (hasLabel) labelGap + textSize else 0f
-        val iconTop = (frame.height - totalHeight) / 2f - 2f * frame.density
+        val iconTop = (frame.height - totalHeight) / 2f - if (hasLabel) 2f * frame.density else 0f
         for ((visual, index) in frame.enabledIndices.withIndex()) {
             val cell = current.getOrNull(index) ?: continue
             val art = holders[cell] ?: continue
             val center = 4f * frame.density + (visual + 0.5f) * frame.slotWidth
             val save = canvas.save()
             canvas.scale(frame.extraScale, frame.extraScale, center, frame.height / 2f)
-            val image = art.image?.takeIf { it.drawable != null } ?: art.alternateImage
-            image?.drawable?.let { drawable ->
+            val image = art.icons.singleOrNull {
+                io.github.offlineglass.hook.adapters.AdapterNavigationSearch.resourceEntryName(it) ==
+                    "main_desk_bottom_navigate_item_img"
+            } ?: art.icons.firstOrNull { it.visibility == View.VISIBLE && it.drawable != null }
+                ?: art.icons.firstOrNull { it.drawable != null }
+            val pair = nativeIcons[cell]
+            (pair?.let { if (foregroundIdle) it.normal else it.selected } ?: image?.drawable)?.let { drawable ->
+                val oldState = drawable.state.clone()
+                val oldFilter = drawable.colorFilter
+                val oldAlpha = drawable.alpha
+                // QQMusic applies night/skin colours on the ImageView, after
+                // loading the resource. Reuse that native presentation as well.
+                drawable.colorFilter = image?.colorFilter
+                drawable.alpha = image?.imageAlpha ?: 255
+                image?.drawableState?.let { drawable.state = it }
                 val oldBounds = Rect(drawable.bounds)
                 val ratio = if (drawable.intrinsicWidth > 0 && drawable.intrinsicHeight > 0)
                     drawable.intrinsicWidth.toFloat() / drawable.intrinsicHeight else 1f
                 val w = if (ratio > 1f) iconSize else iconSize * ratio
                 val h = if (ratio > 1f) iconSize / ratio else iconSize
-                drawable.setBounds((center - w / 2).roundToInt(), iconTop.roundToInt(),
-                    (center + w / 2).roundToInt(), (iconTop + h).roundToInt())
-                try { drawable.draw(canvas) } finally { drawable.bounds = oldBounds }
+                val artworkTop = if (hasLabel) iconTop else (frame.height - h) / 2f
+                drawable.setBounds((center - w / 2).roundToInt(), artworkTop.roundToInt(),
+                    (center + w / 2).roundToInt(), (artworkTop + h).roundToInt())
+                try { drawable.draw(canvas) } finally {
+                    drawable.bounds = oldBounds
+                    drawable.state = oldState
+                    drawable.colorFilter = oldFilter
+                    drawable.alpha = oldAlpha
+                }
             }
-            if (hasLabel) art.text?.let { label ->
-                labelPaint.color = label.currentTextColor
+            if (hasLabel) art.label?.let { label ->
+                labelPaint.color = label.textColors.getColorForState(intArrayOf(android.R.attr.state_enabled,
+                    if (foregroundIdle) -android.R.attr.state_selected else android.R.attr.state_selected),
+                    label.currentTextColor)
                 labelPaint.typeface = label.typeface
                 labelPaint.textSize = textSize
                 // The font ascent includes blank space above the visible glyphs.
                 // Anchor their actual top 1dp below the icon, without moving iconTop.
-                val text = label.text.toString()
+                val text = frame.localizeNavigationLabel(label.text.toString())
                 labelPaint.getTextBounds(text, 0, text.length, labelBounds)
                 val baseline = iconTop + iconSize + frame.density - labelBounds.top
                 canvas.drawText(text, center, baseline, labelPaint)
@@ -244,6 +279,7 @@ internal class QqMusicNavigationState(private val host: GlassHostLayout) : AppNa
         recordedGeometry = Long.MIN_VALUE
         contentInsets.restore()
         holders.clear()
+        nativeIcons.clear()
         lastCells = emptyList()
     }
 

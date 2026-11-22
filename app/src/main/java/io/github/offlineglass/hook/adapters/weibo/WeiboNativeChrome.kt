@@ -20,14 +20,6 @@ internal fun GlassHostLayout.suppressNativeWeiboBottomBar(source: ViewGroup?) {
 
         tabHost?.let { th ->
 
-            val currentTab = runCatching {
-
-                th.javaClass.getMethod("getCurrentTab").invoke(th) as? Int
-
-            }.getOrNull() ?: 0
-
-
-
             var needsLayout = false
 
             for (i in 0 until th.childCount) {
@@ -61,46 +53,6 @@ internal fun GlassHostLayout.suppressNativeWeiboBottomBar(source: ViewGroup?) {
                     child.background = null
 
                     if (child is ImageView) child.setImageDrawable(null)
-
-                }
-
-            }
-
-            if (currentTab == 3) {
-
-                val glassHeight = height.coerceAtLeast(measuredHeight).coerceAtLeast(1)
-
-                val glassBottomGap = (rootView.height * 68f / 2656f).toInt().coerceAtLeast(1)
-
-                val requiredPadding = (glassHeight + glassBottomGap)
-
-                    .coerceAtLeast(source.height.coerceAtLeast(1))
-
-                val tabcontent = (0 until th.childCount).map { th.getChildAt(it) }
-
-                    .firstOrNull { viewResourceEntryName(it).orEmpty() == "tabcontent" }
-
-                if (tabcontent is ViewGroup) {
-
-                    val list = findScrollableList(tabcontent) as? ViewGroup
-
-                    if (list != null && list.paddingBottom != requiredPadding) {
-
-                        list.setPadding(
-
-                            list.paddingLeft, list.paddingTop,
-
-                            list.paddingRight, requiredPadding
-
-                        )
-
-                        list.clipToPadding = false
-
-                        list.clipChildren = false
-
-                        needsLayout = true
-
-                    }
 
                 }
 

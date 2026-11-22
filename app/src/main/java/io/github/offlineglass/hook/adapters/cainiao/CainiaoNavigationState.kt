@@ -112,7 +112,7 @@ internal class CainiaoNavigationState(private val glassHost: GlassHostLayout) : 
     }
 
     override fun captureNavigation(source: ViewGroup, target: Bitmap): Boolean =
-        CainiaoArtworkCapture.capture(source, target)
+        CainiaoArtworkCapture.capture(source, target, glassHost.config.managerEnglishNavigationLabels)
 
     override fun dispose() {
         frameCopyScheduler.cancel()

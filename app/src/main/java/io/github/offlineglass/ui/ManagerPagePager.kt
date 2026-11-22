@@ -23,7 +23,7 @@ internal fun BoxScope.ManagerPagePager(
     modifier: Modifier = Modifier,
     content: @Composable (ManagerPage) -> Unit,
 ) {
-    val pages = ManagerPage.entries
+    val pages = ManagerPage.available
     val pagerState = rememberPagerState(
         initialPage = pages.indexOf(selectedPage).coerceAtLeast(0),
         pageCount = { pages.size },
@@ -48,8 +48,11 @@ internal fun BoxScope.ManagerPagePager(
 
     HorizontalPager(
         state = pagerState,
+        userScrollEnabled = LocalManagerSliderGesture.current?.active != true,
         modifier = modifier,
-        beyondViewportPageCount = pages.lastIndex,
+        // Three bounded root pages: retain adjacent state instead of rebuilding
+        // entire glass/control trees on repeated bottom-bar switches.
+        beyondViewportPageCount = 1,
         key = { pages[it].name },
     ) { page ->
         content(pages[page])

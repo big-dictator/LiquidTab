@@ -14,7 +14,6 @@ import kotlin.math.roundToInt
 internal class TaobaoPageChrome {
     private val taobaoCouponBaseTranslations = java.util.WeakHashMap<View, Float>()
     private var taobaoCouponStrip: View? = null
-    private var lastTaobaoCouponProbe = 0L
     private val taobaoFlashSaleControlBaseTranslations = java.util.WeakHashMap<View, Float>()
     private val taobaoFlashSaleViewportBaseMargins = java.util.WeakHashMap<View, IntArray>()
     private var taobaoFlashSaleCoupon: View? = null
@@ -54,273 +53,69 @@ internal class TaobaoPageChrome {
         }
     }
 
-    fun adjustCoupon(host: View, navigationSource: ViewGroup?, flashSaleActive: Boolean) {
-        val density = host.resources.displayMetrics.density
+    // The native resource is declared in current public.xml. Do not guess a
+    // campaign from its size or an arbitrary matching offer in the product list.
+    private var couponId: Int? = null
+    private var couponTree: android.view.ViewTreeObserver? = null
+    private var couponWindow = java.lang.ref.WeakReference<ViewGroup>(null)
+    private var couponDirty = true
+    private val couponLayout = android.view.ViewTreeObserver.OnGlobalLayoutListener {
+        couponDirty = true
+    }
+    private val couponLocation = IntArray(2)
+    private val couponHostLocation = IntArray(2)
 
-        if (!host.isAttachedToWindow) return
-
-        // Flash Sale owns a different coupon/action overlay. Do not let the
-
-        // generic homepage structural fallback capture one of those views.
-
-        if (flashSaleActive) return
-
-        val root = host.rootView as? ViewGroup ?: return
-
-        val hostLocation = IntArray(2).also(host::getLocationOnScreen)
-
-        val hostTop = hostLocation[1]
-
-        if (hostTop <= 0 || host.width <= 0 || host.height <= 0) return
-
-        // Keep only a small visual gap above the glass. Reusing the host's
-
-        // screen-bottom margin here lifted the coupon strip much too far.
-
-        val desiredBottom = hostTop - (TAOBAO_COUPON_GLASS_GAP_DP * density).roundToInt()
-
-        val now = SystemClock.uptimeMillis()
-
-
-
-        var strip = taobaoCouponStrip?.takeIf { it.isAttachedToWindow && it.isShown }
-
-        // The homepage recreates this view during a tab switch. Resolve its
-
-        // stable id on the very first pre-draw instead of waiting for the
-
-        // throttled hierarchy fallback; that wait exposed one native-position
-
-        // frame and looked like an up/down jump.
-
-        if (strip == null) {
-
-            val popViewId = runCatching {
-
-                host.resources.getIdentifier("homepage_pop_view", "id", host.context.packageName)
-
-            }.getOrDefault(0)
-
-            if (popViewId != 0) {
-
-                strip = root.findViewById<View>(popViewId)
-
-                    ?.takeIf { it.isAttachedToWindow && it.isShown }
-
-                if (strip != null) taobaoCouponStrip = strip
-
-            }
-
+    private fun watchChromeLayout(root: ViewGroup) {
+        if (couponWindow.get() !== root || couponTree?.isAlive != true) {
+            couponTree?.takeIf { it.isAlive }?.removeOnGlobalLayoutListener(couponLayout)
+            couponWindow = java.lang.ref.WeakReference(root)
+            couponTree = root.viewTreeObserver.also { it.addOnGlobalLayoutListener(couponLayout) }
+            couponDirty = true
         }
-
-        if (strip == null && now - lastTaobaoCouponProbe >= TAOBAO_COUPON_PROBE_INTERVAL_MS) {
-
-            lastTaobaoCouponProbe = now
-
-            // Taobao exposes the complete bottom coupon operation module as
-
-            // homepage_pop_view. Prefer this stable container over campaign
-
-            // copy/geometry: its descendants are DX Views and their labels can
-
-            // change or be inaccessible, while moving a child leaves the pink
-
-            // full-width background at the screen bottom.
-
-            var claimView: View? = null
-
-            val stack = ArrayDeque<Pair<View, Int>>()
-
-            if (strip == null) stack += root to 0
-
-            while (stack.isNotEmpty() && claimView == null) {
-
-                val (candidate, depth) = stack.removeLast()
-
-                if (candidate === host || candidate === navigationSource) continue
-
-                val label = when (candidate) {
-
-                    is TextView -> candidate.text?.toString().orEmpty()
-
-                    else -> candidate.contentDescription?.toString().orEmpty()
-
-                }
-
-                if (candidate.isShown && label.contains("\u7acb\u5373\u9886\u53d6")) {
-
-                    claimView = candidate
-
-                    break
-
-                }
-
-                if (candidate is ViewGroup && depth < 15) {
-
-                    for (index in candidate.childCount - 1 downTo 0) {
-
-                        stack += candidate.getChildAt(index) to (depth + 1)
-
-                    }
-
-                }
-
-            }
-
-
-
-            if (strip == null) claimView?.let { claim ->
-
-                var current: View? = claim
-
-                var best: View? = null
-
-                repeat(7) {
-
-                    val candidate = current ?: return@repeat
-
-                    val wideEnough = candidate.width >= root.width * 0.68f
-
-                    val compactEnough = candidate.height in 1..(140f * density).roundToInt()
-
-                    if (wideEnough && compactEnough) best = candidate
-
-                    current = candidate.parent as? View
-
-                }
-
-                strip = best ?: claim
-
-                taobaoCouponStrip = strip
-
-            }
-
-
-
-            // Current Taobao campaign strips are often a single DX-rendered
-
-            // View with no text/contentDescription in the Android hierarchy.
-
-            // Its stable geometry is a compact full-width row ending exactly
-
-            // at the native TabWidget boundary. Use that structure as the
-
-            // fallback instead of depending on campaign copy.
-
-            if (strip == null) {
-
-                val source = navigationSource
-
-                val sourceLocation = source?.let { IntArray(2).also(it::getLocationOnScreen) }
-
-                val sourceTop = sourceLocation?.get(1) ?: Int.MAX_VALUE
-
-                var bestCandidate: View? = null
-
-                var bestScore = Int.MAX_VALUE
-
-                val structuralStack = ArrayDeque<Pair<View, Int>>()
-
-                structuralStack += root to 0
-
-                while (structuralStack.isNotEmpty()) {
-
-                    val (candidate, depth) = structuralStack.removeLast()
-
-                    if (candidate !== host && candidate !== source && candidate.isShown &&
-
-                        candidate.width >= root.width * 0.92f &&
-
-                        candidate.height in (28f * density).roundToInt()..(100f * density).roundToInt()
-
-                    ) {
-
-                        val location = IntArray(2).also(candidate::getLocationOnScreen)
-
-                        val top = location[1]
-
-                        val bottom = top + candidate.height
-
-                        val nearNativeBoundary = top < sourceTop &&
-
-                            bottom in (sourceTop - (8f * density).roundToInt())..
-
-                                (sourceTop + (14f * density).roundToInt())
-
-                        if (nearNativeBoundary) {
-
-                            val score = abs(bottom - sourceTop) +
-
-                                if (candidate is ViewGroup) 0 else 20
-
-                            if (score < bestScore) {
-
-                                bestScore = score
-
-                                bestCandidate = candidate
-
-                            }
-
-                        }
-
-                    }
-
-                    if (candidate is ViewGroup && depth < 15) {
-
-                        for (index in candidate.childCount - 1 downTo 0) {
-
-                            structuralStack += candidate.getChildAt(index) to (depth + 1)
-
-                        }
-
-                    }
-
-                }
-
-                strip = bestCandidate
-
-                taobaoCouponStrip = strip
-
-            }
-
-        }
-
-
-
-        val resolvedStrip = strip ?: return
-
-        val base = taobaoCouponBaseTranslations.getOrPut(resolvedStrip) { resolvedStrip.translationY }
-
-        val location = IntArray(2).also(resolvedStrip::getLocationOnScreen)
-
-        val appliedDelta = resolvedStrip.translationY - base
-
-        val originalBottom = location[1] + resolvedStrip.height - appliedDelta
-
-        val wantedTranslation = base + (desiredBottom - originalBottom)
-
-        if (abs(resolvedStrip.translationY - wantedTranslation) > 0.5f) {
-
-            resolvedStrip.translationY = wantedTranslation
-
-        }
-
-        var ancestor = resolvedStrip.parent as? ViewGroup
-
-        repeat(6) {
-
-            ancestor?.clipChildren = false
-
-            ancestor?.clipToPadding = false
-
-            ancestor = ancestor?.parent as? ViewGroup
-
-        }
-
     }
 
-
-
+    fun adjustCoupon(host: View, navigationSource: ViewGroup?, flashSaleActive: Boolean) {
+        if (!host.isAttachedToWindow || flashSaleActive) return
+        val root = host.rootView as? ViewGroup ?: return
+        watchChromeLayout(root)
+        var strip = taobaoCouponStrip?.takeIf { it.isAttachedToWindow && it.isShown && it.rootView === root }
+        if (couponDirty) {
+            couponDirty = false
+            val id = couponId ?: host.resources.getIdentifier("homepage_pop_view", "id", host.context.packageName).also { couponId = it }
+            strip = null
+            if (id != 0) {
+                var matches = 0
+                val stack = ArrayDeque<Pair<View, Int>>()
+                stack += root to 0
+                var visited = 0
+                while (stack.isNotEmpty() && visited++ < 1600) {
+                    val (view, depth) = stack.removeLast()
+                    if (view === host || view === navigationSource || !view.isShown) continue
+                    if (view.id == id) { matches++; strip = view }
+                    if (view is ViewGroup && depth < 24)
+                        for (i in 0 until view.childCount) stack += view.getChildAt(i) to (depth + 1)
+                }
+                // Reject duplicate IDs and a truncated search rather than
+                // arbitrarily moving the first native view with the same ID.
+                if (matches != 1 || stack.isNotEmpty()) strip = null
+            }
+            taobaoCouponStrip = strip
+        }
+        val target = strip ?: return
+        val density = host.resources.displayMetrics.density
+        host.getLocationOnScreen(couponHostLocation)
+        if (couponHostLocation[1] <= 0 || host.width <= 0 || host.height <= 0) return
+        val base = taobaoCouponBaseTranslations.getOrPut(target) { target.translationY }
+        target.getLocationOnScreen(couponLocation)
+        val originalBottom = couponLocation[1] + target.height - (target.translationY - base)
+        val wanted = base + couponHostLocation[1] - (TAOBAO_COUPON_GLASS_GAP_DP * density).roundToInt() - originalBottom
+        if (abs(target.translationY - wanted) > 0.5f) target.translationY = wanted
+        var ancestor = target.parent as? ViewGroup
+        repeat(6) {
+            ancestor?.let { if (it.clipChildren) it.clipChildren = false; if (it.clipToPadding) it.clipToPadding = false }
+            ancestor = ancestor?.parent as? ViewGroup
+        }
+    }
 
     fun adjustFlashSaleControls(host: View, navigationSource: ViewGroup?, flashSaleActive: Boolean) {
         val density = host.resources.displayMetrics.density
@@ -475,13 +270,9 @@ internal class TaobaoPageChrome {
             val base = flashViewportPaddings.getOrPut(viewport) {
                 intArrayOf(viewport.paddingLeft, viewport.paddingTop, viewport.paddingRight, viewport.paddingBottom)
             }
-            val location = IntArray(2).also(viewport::getLocationOnScreen)
-            // Anchor to the resting bar, not its animated translation. Keeping
-            // viewport geometry fixed during a drag prevents repeated engine resize.
-            val restingTop = hostTop - host.translationY
-            val bottom = location[1] + viewport.height
-            val reserve = (bottom - restingTop + TAOBAO_FLASH_ACTION_GAP_DP * density)
-                .roundToInt().coerceAtLeast(base[3]).coerceAtMost((viewport.height / 3).coerceAtLeast(base[3]))
+            // Full feed viewport is independent of coupon lifecycle/style success.
+            // Do not reintroduce the old blank band when a remote resource changes.
+            val reserve = 0
             if (viewport.paddingBottom != reserve) {
                 viewport.setPadding(base[0], base[1], base[2], reserve)
             }
@@ -649,7 +440,7 @@ internal class TaobaoPageChrome {
         val density = host.resources.displayMetrics.density
 
         if (!host.isAttachedToWindow) return
-        if (selectedIndex != 3) return
+        if (selectedIndex != 3 || !host.hasWindowFocus()) { TaobaoCartNativeBridge.suspend(); return }
 
         val root = host.rootView as? ViewGroup ?: return
 
@@ -714,6 +505,21 @@ internal class TaobaoPageChrome {
 
             )
 
+        }
+
+        (host as? GlassHostLayout)?.let { TaobaoCartInitialResource.prepareRoot(resolvedRoot, it) }
+        if (TaobaoCartInitialResource.owns(resolvedRoot)) {
+            ((host as? GlassHostLayout)?.appNavigationState as? TaobaoNavigationState)?.bindCartScene(resolvedRoot)
+            (host as? GlassHostLayout)?.let {
+                TaobaoCartInitialResource.bindNativeButtons(resolvedRoot, it)
+            }
+            if (resolvedRoot.paddingLeft != base[0] || resolvedRoot.paddingTop != base[1] ||
+                resolvedRoot.paddingRight != base[2] || resolvedRoot.paddingBottom != base[3]) {
+                resolvedRoot.setPadding(base[0], base[1], base[2], base[3])
+            }
+            resolvedRoot.clipChildren = false
+            resolvedRoot.clipToPadding = false
+            return
         }
 
         val hostLocation = IntArray(2).also(host::getLocationOnScreen)
@@ -868,6 +674,9 @@ internal class TaobaoPageChrome {
 
 
     fun dispose() {
+        couponTree?.takeIf { it.isAlive }?.removeOnGlobalLayoutListener(couponLayout)
+        couponTree = null; couponWindow.clear(); couponDirty = true
+        TaobaoCartNativeBridge.clear()
         cartInitialLayoutRequested = null
         restoreTaobaoFlashSaleBottomControls()
         taobaoCouponBaseTranslations.forEach { (view, base) -> if (view.isAttachedToWindow) view.translationY = base }

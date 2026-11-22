@@ -2,7 +2,7 @@ package io.github.offlineglass.hook.adapters.youtube
 
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
 import kotlin.math.abs

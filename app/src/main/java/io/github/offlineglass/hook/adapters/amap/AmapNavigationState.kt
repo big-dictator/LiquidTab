@@ -14,9 +14,10 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.adapters.localizeNavigationLabel
 import kotlin.math.max
 
 /** Amap's native LiteTabBar assets and AI-chat page gate, scoped to one glass host. */
@@ -27,6 +28,11 @@ internal class AmapNavigationState(private val context: Context) : AppNavigation
     private var populateAttempted = false
     private var aiChatCacheAt = 0L
     private var aiChatCached = false
+    private var aiChatRoot: View? = null
+    private var aiChatLayoutDirty = true
+    private val aiChatLayoutListener = android.view.ViewTreeObserver.OnGlobalLayoutListener {
+        aiChatLayoutDirty = true
+    }
     private val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
@@ -116,6 +122,25 @@ internal class AmapNavigationState(private val context: Context) : AppNavigation
         }.onFailure { XposedBridge.log("[OfflineGlass][Amap] icon bitmap: $it") }.getOrNull()
     }
 
+    private fun cellIconBitmap(cell: ViewGroup): Bitmap? {
+        val iconContainerId = context.resources.getIdentifier("icon_img", "id", context.packageName)
+        val iconContainer = if (iconContainerId != 0) cell.findViewById<View>(iconContainerId) else null
+        if (iconContainer != null && iconContainer.width > 0 && iconContainer.height > 0 &&
+            iconContainer.isShown && iconContainer.width <= cell.width && iconContainer.height <= cell.height) {
+            runCatching {
+                Bitmap.createBitmap(iconContainer.width, iconContainer.height, Bitmap.Config.ARGB_8888).also {
+                    iconContainer.draw(Canvas(it))
+                }
+            }.getOrNull()?.let { bitmap ->
+                val pixels = IntArray(bitmap.width * bitmap.height)
+                bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+                if (pixels.any { it ushr 24 != 0 }) return bitmap
+                bitmap.recycle()
+            }
+        }
+        return cellIcon(cell)?.let(::iconBitmap)
+    }
+
     private fun populate(source: ViewGroup): Boolean {
         if (populated) return true
         val nativeCells = cells(source)
@@ -123,15 +148,16 @@ internal class AmapNavigationState(private val context: Context) : AppNavigation
         var filled = 0
         for (index in nativeCells.indices) {
             if (index >= icons.size) break
-            val bitmap = cellIcon(nativeCells[index])?.let(::iconBitmap)
+            val bitmap = cellIconBitmap(nativeCells[index])
             if (bitmap != null) {
                 icons[index]?.takeUnless(Bitmap::isRecycled)?.recycle()
                 icons[index] = bitmap
                 filled++
             }
             labels[index] = cellLabel(nativeCells[index])
+                ?: arrayOf("首页", "附近", "消息", "打车", "我的").getOrNull(index)
         }
-        populated = filled > 0
+        populated = filled == nativeCells.size && nativeCells.size in 2..7
         if (populated) runCatching { if (source.alpha != 0f) source.alpha = 0f }
         XposedBridge.log("[OfflineGlass][Amap] populated icons: $filled/${nativeCells.size}")
         return populated
@@ -139,8 +165,16 @@ internal class AmapNavigationState(private val context: Context) : AppNavigation
 
     override fun prepare(source: ViewGroup?, schedule: (Long, () -> Unit) -> Unit) {
         if (populated || populateAttempted || source == null || source.width <= 0 || source.height <= 0) return
+        if (populate(source)) {
+            source.rootView.postInvalidateOnAnimation()
+            return
+        }
         populateAttempted = true
-        source.postDelayed({ if (!populated && source.width > 0) populate(source) }, 280L)
+        source.postDelayed({
+            if (!populated && source.width > 0 && populate(source)) {
+                source.rootView.postInvalidateOnAnimation()
+            } else if (!populated) populateAttempted = false
+        }, 280L)
     }
 
     override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
@@ -155,9 +189,9 @@ internal class AmapNavigationState(private val context: Context) : AppNavigation
             val viewport = 31.68f * density
             val gap = 3f * density
             val groupTop = height / 2f - (viewport + gap + labelHeight) / 2f
-            val iconCenterY = groupTop + viewport / 2f
+            val iconCenterY = if (iconOnly) height / 2f else groupTop + viewport / 2f
             val labelBaseline = groupTop + viewport + gap - fm.ascent
-            for ((visualIndex, index) in enabledIndices.asReversed().withIndex()) {
+            for ((visualIndex, index) in enabledIndices.withIndex()) {
                 val selected = index == selectedIndex
                 val centerX = horizontalPadding + (visualIndex + 0.5f) * slotWidth
                 val bitmap = icons.getOrNull(index)?.takeUnless(Bitmap::isRecycled) ?: continue
@@ -174,10 +208,10 @@ internal class AmapNavigationState(private val context: Context) : AppNavigation
                 iconPaint.alpha = if (selected) 255 else 235
                 canvas.drawBitmap(bitmap, null, RectF(centerX - dw / 2f, iconCenterY - dh / 2f,
                     centerX + dw / 2f, iconCenterY + dh / 2f), iconPaint)
-                if (label != null) {
+                if (!iconOnly && label != null) {
                     labelPaint.color = color
                     labelPaint.alpha = if (selected) 255 else 235
-                    canvas.drawText(label, centerX, labelBaseline, labelPaint)
+                    canvas.drawText(frame.localizeNavigationLabel(label), centerX, labelBaseline, labelPaint)
                 }
                 canvas.restore()
             }
@@ -198,10 +232,19 @@ internal class AmapNavigationState(private val context: Context) : AppNavigation
     override fun pageAllowsNavigation(root: View?): Boolean = !isAiChatActive(root)
 
     private fun isAiChatActive(root: View?): Boolean {
-        val now = SystemClock.uptimeMillis()
-        if (now - aiChatCacheAt < 180L) return aiChatCached
-        aiChatCacheAt = now
         root ?: return aiChatCached
+        if (root !== aiChatRoot) {
+            aiChatRoot?.viewTreeObserver?.takeIf { it.isAlive }
+                ?.removeOnGlobalLayoutListener(aiChatLayoutListener)
+            aiChatRoot = root
+            root.viewTreeObserver.addOnGlobalLayoutListener(aiChatLayoutListener)
+            aiChatLayoutDirty = true
+        }
+        val now = SystemClock.uptimeMillis()
+        val fallbackInterval = if (aiChatCached) 500L else 2_000L
+        if (!aiChatLayoutDirty && now - aiChatCacheAt < fallbackInterval) return aiChatCached
+        aiChatLayoutDirty = false
+        aiChatCacheAt = now
         val stack = ArrayDeque<View>()
         stack += root
         var found = false
@@ -222,6 +265,9 @@ internal class AmapNavigationState(private val context: Context) : AppNavigation
     }
 
     override fun dispose() {
+        aiChatRoot?.viewTreeObserver?.takeIf { it.isAlive }
+            ?.removeOnGlobalLayoutListener(aiChatLayoutListener)
+        aiChatRoot = null
         icons.forEach { it?.takeUnless(Bitmap::isRecycled)?.recycle() }
         icons.fill(null)
         labels.fill(null)

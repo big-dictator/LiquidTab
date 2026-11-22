@@ -18,5 +18,8 @@ internal val targetSpec: TargetSpec = TargetSpec("tieba", "com.baidu.tieba", "�
             idHints = setOf("bottom_navigation", "tab_bar", "navigation_bar"),
             classHints = setOf("MainTabActivity", "BottomTabLayout", "TabBar"),
             textHints = setOf("首页", "进吧", "小卖部", "消息", "我的"),
-            preferredSlots = 5..5, supportsPostButton = false,
-            defaultAccentColor = 0xFF2B7AFE.toInt(), entryLabels = listOf("首页", "进吧", "小卖部", "消息", "我的"), drawsNavigationInOptics = true, sceneVisibilityAnimation = true)
+            preferredSlots = 5..5, supportsPostButton = true,
+            defaultAccentColor = 0xFF2B7AFE.toInt(), entryLabels = listOf("首页", "进吧", "发布", "消息", "我的"), drawsNavigationInOptics = true, sceneVisibilityAnimation = true)
+
+// Dominant opaque color of the native migrated bottom publish artwork.
+internal const val TIEBA_PUBLISH_BLUE = 0xFF4170FF.toInt()

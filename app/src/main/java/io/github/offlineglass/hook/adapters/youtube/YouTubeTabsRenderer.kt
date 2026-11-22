@@ -1,106 +1,100 @@
 package io.github.offlineglass.hook.adapters.youtube
 
 import android.graphics.Canvas
-import android.view.View
-import android.view.ViewGroup
-import android.widget.TextView
+import android.graphics.Paint
+import android.graphics.Typeface
+import android.graphics.drawable.Drawable
 import android.os.SystemClock
+import android.view.View
+import android.widget.ImageView
+import android.widget.TextView
+import io.github.offlineglass.config.GlassConfig
 
-/** Projects native artwork into glass slots, independent of native row insets. */
+/** Retains native artwork, without replaying recycled/hidden native Views. */
 internal class YouTubeTabsRenderer {
-    private data class Tab(val group: ViewGroup, val icon: View?, val label: TextView?,
-                           val badges: List<View>, val childCount: Int)
-    private var cachedSource: ViewGroup? = null
-    private var cachedCount = 0
-    private var cachedTabs: List<Tab> = emptyList()
+    var opticalSelected: Boolean? = null
+    private data class Artwork(val drawable: Drawable, val label: String, val typeface: Typeface?, val state: IntArray, val badge: String?)
+    private val artwork = HashMap<Int, Artwork>()
     private var nextRefresh = 0L
-    private val origin = IntArray(2)
-    private val position = IntArray(2)
+    private var bindingIdentity: YouTubePivotBinding? = null
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+    private val avatarClip = android.graphics.Path()
+    private val selectedState = intArrayOf(android.R.attr.state_enabled, android.R.attr.state_selected, android.R.attr.state_activated)
+    private val normalState = intArrayOf(android.R.attr.state_enabled)
 
-    fun clear() {
-        cachedSource = null
-        cachedTabs = emptyList()
-        nextRefresh = 0L
-    }
-    private fun name(view: View) = runCatching {
-        view.resources.getResourceEntryName(view.id)
-    }.getOrNull()
+    fun clear() { artwork.clear(); nextRefresh = 0L; bindingIdentity = null }
 
-    private fun find(root: View, id: String): View? {
-        if (name(root) == id) return root
-        if (root is ViewGroup) for (index in 0 until root.childCount) {
-            find(root.getChildAt(index), id)?.let { return it }
-        }
-        return null
-    }
-
-    private fun tabs(source: ViewGroup, count: Int): List<ViewGroup> {
-        val queue = ArrayDeque<ViewGroup>()
-        queue += source
-        while (queue.isNotEmpty()) {
-            val group = queue.removeFirst()
-            val children = (0 until group.childCount).map(group::getChildAt)
-            if (children.size == count && children.all {
-                it is ViewGroup && (find(it, "thumbnail_layout") != null || find(it, "image") != null)
-            }) return children.filterIsInstance<ViewGroup>()
-            children.filterIsInstance<ViewGroup>().forEach(queue::addLast)
-        }
-        return emptyList()
-    }
-
-    private fun tab(source: ViewGroup, count: Int, index: Int): Tab? {
+    private fun refresh(binding: YouTubePivotBinding) {
         val now = SystemClock.uptimeMillis()
-        if (cachedSource !== source || cachedCount != count || now >= nextRefresh ||
-            cachedTabs.any { it.group.parent == null || it.group.childCount != it.childCount ||
-                (it.icon != null && it.icon.parent == null) || (it.label != null && it.label.parent == null) }) {
-            cachedSource = source
-            cachedCount = count
-            cachedTabs = tabs(source, count).map { group ->
-                Tab(group, find(group, "thumbnail_layout") ?: find(group, "image"),
-                    find(group, "text") as? TextView,
-                    listOfNotNull(find(group, "new_content_dot"), find(group, "new_content_count")),
-                    group.childCount)
+        if (bindingIdentity !== binding) {
+            artwork.clear()
+            bindingIdentity = binding
+        } else if (now < nextRefresh) return
+        nextRefresh = now + 250L
+        for (index in 0..4) {
+            val entry = binding.entry(index) ?: continue
+            val native = entry.icon.drawable ?: continue
+            val copy = native.constantState?.newDrawable(entry.icon.resources, entry.icon.context.theme)?.mutate() ?: continue
+            entry.icon.imageTintList?.let(copy::setTintList)
+            native.colorFilter?.let(copy::setColorFilter)
+            val countView = YouTubePivotBinding.child(entry.cell, "new_content_count") as? TextView
+            val dot = YouTubePivotBinding.child(entry.cell, "new_content_dot")
+            val badge = countView?.takeIf { it.visibility == View.VISIBLE && it.text.isNotBlank() }
+                ?.text?.toString() ?: dot?.takeIf { it.visibility == View.VISIBLE }?.let { "" }
+            artwork[index] = Artwork(copy, entry.text?.text?.toString()?.takeIf(String::isNotBlank) ?: entry.label,
+                entry.text?.typeface, native.state.copyOf(), badge)
+        }
+    }
+
+    fun drawSlot(canvas: Canvas, binding: YouTubePivotBinding, index: Int,
+                 centerX: Float, centerY: Float, iconScale: Float, config: GlassConfig,
+                 opticalSelected: Boolean? = null, dark: Boolean = true,
+                 iconOnly: Boolean = config.iconOnly,
+                 localizeLabel: (String) -> String = { it }): Boolean {
+        refresh(binding)
+        val item = artwork[index] ?: return false
+        val source = binding.source
+        val d = source.resources.displayMetrics.density
+        val sd = source.resources.displayMetrics.scaledDensity
+        val size = 24f * d * 1.08f * iconScale
+        val labelSize = config.textSize * sd * 1.08f * iconScale / config.iconScale.coerceAtLeast(.01f)
+        textPaint.textSize = labelSize; textPaint.typeface = item.typeface
+        textPaint.color = if (dark) android.graphics.Color.WHITE else android.graphics.Color.BLACK
+        val fm = textPaint.fontMetrics
+        val labelHeight = if (iconOnly) 0f else fm.descent - fm.ascent
+        val gap = if (iconOnly) 0f else 2f*d
+        val top = centerY - (size + gap + labelHeight)/2f
+        val drawable = item.drawable
+        drawable.state = when (opticalSelected) {
+            true -> selectedState
+            false -> normalState
+            null -> item.state
+        }
+        drawable.alpha = 255
+        drawable.setBounds((centerX-size/2f).toInt(), top.toInt(), (centerX+size/2f).toInt(), (top+size).toInt())
+        if (index == 4) {
+            // The native profile artwork is a square bitmap. Crop only its
+            // icon pixels to a circular viewport, without changing the label,
+            // badge, or other tab artwork.
+            val save = canvas.save()
+            avatarClip.rewind()
+            avatarClip.addCircle(centerX, top + size / 2f, size / 2f, android.graphics.Path.Direction.CW)
+            canvas.clipPath(avatarClip)
+            drawable.draw(canvas)
+            canvas.restoreToCount(save)
+        } else {
+            drawable.draw(canvas)
+        }
+        if (!iconOnly) canvas.drawText(localizeLabel(item.label), centerX, top+size+gap-fm.ascent, textPaint)
+        item.badge?.let { badge ->
+            val x = centerX + size*.42f; val y = top + size*.08f
+            textPaint.color = 0xFFFF0033.toInt()
+            canvas.drawCircle(x, y, if (badge.isEmpty()) 3f*d else 5.5f*d, textPaint)
+            if (badge.isNotEmpty()) {
+                textPaint.color = android.graphics.Color.WHITE; textPaint.textSize = 7f*sd
+                canvas.drawText(badge.take(2), x, y-(textPaint.fontMetrics.ascent+textPaint.fontMetrics.descent)/2f, textPaint)
             }
-            // Recheck lazy badge stubs and native row replacements; never
-            // rescan the entire row for every slot or optical pass.
-            nextRefresh = now + 250L
         }
-        return cachedTabs.getOrNull(index)
-    }
-
-    private fun draw(canvas: Canvas, view: View, x: Float, y: Float, scale: Float) {
-        canvas.save()
-        canvas.translate(x, y)
-        canvas.scale(scale, scale)
-        // Direct View.draw does not apply the View's RenderNode alpha.
-        // Avoid invalidating native layout/parents with temporary alpha writes.
-        try { view.draw(canvas) } finally { canvas.restore() }
-    }
-
-    fun drawSlot(canvas: Canvas, source: ViewGroup, count: Int, index: Int,
-                 centerX: Float, centerY: Float, iconScale: Float, iconOnly: Boolean) {
-        val tab = tab(source, count, index) ?: return
-        val icon = tab.icon
-            ?.takeIf { it.width > 0 && it.height > 0 }
-        val label = tab.label
-            ?.takeIf { !iconOnly && it.visibility == View.VISIBLE && it.width > 0 && it.height > 0 }
-        val scale = 1.08f * iconScale
-        val iconHeight = (icon?.height ?: 0) * scale
-        val labelHeight = (label?.height ?: 0) * scale
-        val gap = if (icon != null && label != null) {
-            icon.getLocationInWindow(origin)
-            label.getLocationInWindow(position)
-            (position[1] - origin[1] - icon.height).coerceAtLeast(0).toFloat()
-        } else 0f
-        val top = centerY - (iconHeight + gap + labelHeight) / 2f
-        icon?.let { draw(canvas, it, centerX - it.width * scale / 2f, top, scale) }
-        label?.let { draw(canvas, it, centerX - it.width * scale / 2f, top + iconHeight + gap, scale) }
-        if (icon != null) for (badge in tab.badges) {
-            if (badge.visibility != View.VISIBLE || badge.width <= 0) continue
-            icon.getLocationInWindow(origin)
-            badge.getLocationInWindow(position)
-            draw(canvas, badge, centerX - icon.width * scale / 2f + (position[0] - origin[0]) * scale,
-                top + (position[1] - origin[1]) * scale, scale)
-        }
+        return true
     }
 }

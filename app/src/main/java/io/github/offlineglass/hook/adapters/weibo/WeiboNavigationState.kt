@@ -12,13 +12,15 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XposedBridge
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 import io.github.offlineglass.hook.adapters.AppNavigationState
+import io.github.offlineglass.hook.adapters.localizeNavigationLabel
 import io.github.offlineglass.hook.GlassHostLayout
 import kotlin.math.floor
 import kotlin.math.roundToInt
@@ -31,6 +33,7 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
     internal var videoHideTime = 0L
     internal var messageHideTime = 0L
     internal var messagePeekUntil = 0L
+    internal val messageSafety = WeiboMessageSafety()
     private var activeHost: GlassHostLayout? = null
     private var receiverRegistered = false
     private val tabReceiver = object : BroadcastReceiver() {
@@ -49,6 +52,7 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     }
     private val badgeTexts = arrayOfNulls<String>(5)
+    private val iconContentBounds = java.util.IdentityHashMap<Bitmap, Rect>()
     private val normalLight by lazy(LazyThreadSafetyMode.NONE) { NORMAL_LIGHT.map(::loadBitmap) }
     private val selectedLight by lazy(LazyThreadSafetyMode.NONE) { SELECTED_LIGHT.map(::loadBitmap) }
     private val normalDark by lazy(LazyThreadSafetyMode.NONE) { NORMAL_DARK.map(::loadBitmap) }
@@ -67,11 +71,33 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
     }
 
     override fun dispose() {
+        edgeGradient.clear()
+        WeiboHomeTopBar.dispose(activeHost)
+        messageSafety.dispose()
         if (receiverRegistered) runCatching { context.unregisterReceiver(tabReceiver) }
         rewardBaseTranslations.forEach { (view, base) -> if (view.isAttachedToWindow) view.translationY = base }
         rewardBaseTranslations.clear(); rewardTarget = null
         receiverRegistered = false; activeHost = null
     }
+
+    private val edgeGradient = WeiboBottomGradient()
+    override fun onHostFrame(host: View) {
+        val glassHost = host as? GlassHostLayout ?: return
+        glassHost.opticalSurfaceViewForAdapter?.let { if (it.isForceDarkAllowed) it.setForceDarkAllowed(false) }
+        activeHost = glassHost
+        edgeGradient.update(glassHost, glassHost.config.enabled, glassHost.isDarkGlass())
+        WeiboHomeTopBar.observe(glassHost)
+        messageSafety.update(glassHost)
+        if (messageSafety.active) glassHost.resetMessageScrollStopState()
+    }
+
+    override fun onHostDetached() {
+        messageSafety.dispose()
+        edgeGradient.clear()
+        WeiboHomeTopBar.dispose(activeHost)
+    }
+
+    override fun pageRequiresScrollStopHide(selectedIndex: Int) = false
 
     override fun captureNavigation(source: ViewGroup, target: Bitmap): Boolean {
         if (source.width <= 0 || source.height <= 0) return false
@@ -111,33 +137,25 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
     override fun refreshNavigationSource(host: View) =
         (host as? GlassHostLayout)?.refreshWeiboNavigationSource() == true
 
-    override fun resolveAutoDarkMode(host: View): Boolean? =
-        (host as? GlassHostLayout)?.adapterContentOrSystemDark()
 
     override fun pageAllowsNavigation(root: View?): Boolean? =
         activeHost?.weiboPageAllowsNavigation()
+
+    override fun hostPageAllowsNavigation(host: GlassHostLayout, root: View?): Boolean? {
+        activeHost = host
+        return host.weiboPageAllowsNavigation()
+    }
 
     override fun handleSystemBack(host: View): Boolean {
         val glassHost = host as? GlassHostLayout ?: return false
         return when (WeiboAdapter.currentTab) {
             1 -> {
                 val previous = WeiboAdapter.lastNonVideoTab
-                runCatching {
-                    glassHost.findWeiboTabHost()?.javaClass
-                        ?.getMethod("setCurrentTab", Int::class.javaPrimitiveType)
-                        ?.invoke(glassHost.findWeiboTabHost(), previous)
-                }
+                glassHost.findWeiboTabHost()?.currentTab = previous
                 videoHideTime = 0L
                 glassHost.snapToNavigationIndex(previous)
                 WeiboAdapter.currentTab = previous
                 glassHost.post { refreshNavigationSource(glassHost) }
-                true
-            }
-            3 -> {
-                messageHideTime = 0L
-                messagePeekUntil = android.os.SystemClock.uptimeMillis() + 1_500L
-                glassHost.resetMessageScrollStopState()
-                glassHost.postInvalidateOnAnimation()
                 true
             }
             else -> false
@@ -156,8 +174,7 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
         refreshNavigationSource(glassHost)
         val tabHost = glassHost.findWeiboTabHost() ?: return false
         return runCatching {
-            tabHost.javaClass.getMethod("setCurrentTab", Int::class.javaPrimitiveType)
-                .invoke(tabHost, index)
+            tabHost.currentTab = index
             WeiboAdapter.currentTab = index
             glassHost.postInvalidateOnAnimation()
             true
@@ -174,20 +191,40 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
         val itemScale = frame.iconScale * frame.extraScale
         labelPaint.textSize = 11f * frame.scaledDensity
         badgeTextPaint.textSize = 9f * frame.scaledDensity
+        var contentTop = Float.POSITIVE_INFINITY
+        var contentBottom = Float.NEGATIVE_INFINITY
+        for (bitmap in icons + selectedIcons) {
+            if (bitmap == null) continue
+            val bounds = contentBounds(bitmap)
+            val top = ICON_CENTER_Y_DP * frame.density + (bounds.top.toFloat() / bitmap.height - .5f) * iconSize
+            val bottom = ICON_CENTER_Y_DP * frame.density + (bounds.bottom.toFloat() / bitmap.height - .5f) * iconSize
+            contentTop = minOf(contentTop, top)
+            contentBottom = maxOf(contentBottom, bottom)
+        }
+        val textBounds = Rect()
+        if (!frame.iconOnly) frame.enabledIndices.forEach { index ->
+            val text = frame.localizeNavigationLabel(LABELS[index])
+            labelPaint.getTextBounds(text, 0, text.length, textBounds)
+            contentTop = minOf(contentTop, LABEL_BASELINE_DP * frame.density + textBounds.top)
+            contentBottom = maxOf(contentBottom, LABEL_BASELINE_DP * frame.density + textBounds.bottom)
+        }
+        val centerOffset = if (contentTop.isFinite() && contentBottom.isFinite())
+            WeiboGeometry.centerOffset(frame.height.toFloat(), contentTop, contentBottom) else 0f
         frame.enabledIndices.forEachIndexed { visualIndex, index ->
             val selected = index == frame.selectedIndex
-            val bitmap = (if (selected) selectedIcons else icons).getOrNull(index) ?: return@forEachIndexed
+            val bitmap = (if (selected) selectedIcons else icons).getOrNull(index)
             val centerX = horizontalPadding + (visualIndex + .5f) * frame.slotWidth
             canvas.save(); canvas.scale(itemScale, itemScale, centerX, frame.height / 2f)
+            canvas.translate(0f, centerOffset)
             iconPaint.alpha = if (selected) 255 else 238
             iconPaint.colorFilter = if (frame.darkGlass && !selected)
                 BlendModeColorFilter(Color.WHITE, BlendMode.SRC_IN) else null
             val centerY = ICON_CENTER_Y_DP * frame.density
-            canvas.drawBitmap(bitmap, null, RectF(centerX - iconSize / 2f, centerY - iconSize / 2f,
+            if (bitmap != null) canvas.drawBitmap(bitmap, null, RectF(centerX - iconSize / 2f, centerY - iconSize / 2f,
                 centerX + iconSize / 2f, centerY + iconSize / 2f), iconPaint)
             labelPaint.color = if (selected) ACCENT_COLOR else normalColor
             labelPaint.alpha = if (selected) 255 else 238
-            canvas.drawText(LABELS[index], centerX, LABEL_BASELINE_DP * frame.density, labelPaint)
+            if (!frame.iconOnly) canvas.drawText(frame.localizeNavigationLabel(LABELS[index]), centerX, LABEL_BASELINE_DP * frame.density, labelPaint)
             badgeTexts.getOrNull(index)?.takeUnless(String::isNullOrBlank)?.let { badge ->
                 val bx = centerX + 13f * frame.density; val by = 13f * frame.density
                 canvas.drawCircle(bx, by, (if (badge.length <= 1) 8f else 10f) * frame.density, badgePaint)
@@ -199,6 +236,20 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
         iconPaint.alpha = 255; iconPaint.colorFilter = null; labelPaint.alpha = 255
     }
 
+    private fun contentBounds(bitmap: Bitmap): Rect = iconContentBounds.getOrPut(bitmap) {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        var top = bitmap.height
+        var bottom = 0
+        for (y in 0 until bitmap.height) for (x in 0 until bitmap.width) {
+            if (Color.alpha(pixels[y * bitmap.width + x]) > 8) {
+                top = minOf(top, y)
+                bottom = maxOf(bottom, y + 1)
+            }
+        }
+        if (bottom > top) Rect(0, top, bitmap.width, bottom) else Rect(0, 0, bitmap.width, bitmap.height)
+    }
+
     private fun loadBitmap(fileName: String): Bitmap? {
         val path = "weibo/$fileName"
         runCatching {
@@ -206,7 +257,9 @@ internal class WeiboNavigationState(private val context: Context) : AppNavigatio
                 .open(path).use(BitmapFactory::decodeStream)
         }.getOrNull()?.let { return it }
         return runCatching { javaClass.classLoader?.getResourceAsStream(path)?.use(BitmapFactory::decodeStream) }
-            .onFailure { XposedBridge.log("[LiquidTab][WeiboIcons] $fileName: $it") }.getOrNull()
+            .getOrNull() ?: WeiboEmbeddedIcons.decode(fileName).also { bitmap ->
+                if (bitmap == null) XposedBridge.log("[LiquidTab][WeiboIcons] Unable to decode $fileName")
+            }
     }
 
     private companion object {

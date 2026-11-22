@@ -6,10 +6,10 @@ import android.os.SystemClock
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 import io.github.offlineglass.hook.adapters.TargetAdapterRegistry
 import io.github.offlineglass.hook.adapters.TargetHookSignalsRegistry
 import io.github.offlineglass.hook.adapters.TargetHookSignal
@@ -28,7 +28,12 @@ object TargetHooks {
         // rebuild resets the outer device list scroll position and moves the
         // still-present "More settings" row back behind the floating bar. The
         // actual return failure is handled at the navigation binding layer.
-        (signalsFor(spec.key) + adapter?.hookSignals().orEmpty()).forEach { signal ->
+        // Registry already consults the adapter. Merge by class/method so mixed
+        // providers and overlapping lists never install the same hook twice.
+        val signals = (signalsFor(spec.key) + adapter?.hookSignals().orEmpty())
+            .groupBy { it.className }
+            .map { (name, entries) -> Signal(name, entries.flatMap { it.methods }.distinct()) }
+        signals.forEach { signal ->
             val targetClass = runCatching {
                 XposedHelpers.findClass(signal.className, lpparam.classLoader)
             }.getOrNull() ?: return@forEach

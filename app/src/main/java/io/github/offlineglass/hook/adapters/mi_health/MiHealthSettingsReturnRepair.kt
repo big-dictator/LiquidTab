@@ -1,10 +1,10 @@
 package io.github.offlineglass.hook.adapters.mi_health
 
 import android.app.Activity
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 import io.github.offlineglass.targets.TargetSpec
 
 /** Preserved, currently dormant settings-return repair; not auto-installed. */

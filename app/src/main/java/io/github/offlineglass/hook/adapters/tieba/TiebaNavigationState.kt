@@ -6,6 +6,13 @@ import io.github.offlineglass.hook.GlassHostLayout
 import io.github.offlineglass.hook.adapters.AppNavigationState
 import io.github.offlineglass.hook.globalGlassBottomGapPx
 import android.graphics.Rect
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.widget.FrameLayout
+import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
+import io.github.offlineglass.hook.adapters.AdapterOwnedOverlay
 import android.os.SystemClock
 import kotlin.math.abs
 
@@ -17,6 +24,73 @@ internal class TiebaNavigationState(private val glassHost: GlassHostLayout) : Ap
     private var liveSearchControl: View? = null
     private var lastProbeAt = 0L
     private var lastBlockScanAt = 0L
+    private var publishArtwork: FrameLayout? = null
+    private var publishAlpha = 1f
+    private val publishPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private var lastAnimatedCapture = 0L
+    private val bottomArtwork = TiebaBottomArtwork()
+    private val bottomGradient = TiebaEdgeGradient(top = false)
+    private val feedBottomInsets = TiebaFeedBottomInsets()
+    private var isEnabled = true
+
+    override fun onHostFrame(host: View) {
+        isEnabled = glassHost.config.enabled
+        feedBottomInsets.update(glassHost, isEnabled)
+        if (isEnabled) bottomArtwork.prepareOptical(glassHost.navigationSource)
+        bottomGradient.updateBottom(glassHost, isEnabled)
+    }
+
+    override fun navigationOpticalMixEnabled(): Boolean = isEnabled && bottomArtwork.opticalReady
+
+    override fun includeNavigationInIndicatorScene(surfaceActive: Boolean): Boolean =
+        navigationOpticalMixEnabled()
+
+    override fun backdropSceneViews(content: ViewGroup, hostIndex: Int): List<View> =
+        (0 until hostIndex).map(content::getChildAt)
+            .filterNot { it is AdapterOwnedOverlay || it is GlassHostLayout }
+
+    override fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
+        if (frame.hideSelectedForOptics) {
+            if (bottomArtwork.opticalReady) {
+                bottomArtwork.drawOptical(canvas, frame, selected = true)
+                if (frame.barLayout == null) drawPublish(canvas, frame)
+            }
+        } else {
+            glassHost.drawOriginalNavigationForAdapter(canvas, frame.extraScale)
+        }
+    }
+
+    override fun captureNavigation(source: ViewGroup, target: android.graphics.Bitmap): Boolean =
+        glassHost.config.bottomBarIconOnly && bottomArtwork.capture(source, target)
+
+    override fun sourceContentOffsetY(
+        index: Int,
+        selectedIndex: Int,
+        hostHeight: Int,
+        transformDy: Float,
+        transformScale: Float,
+    ): Float? {
+        if (!glassHost.config.bottomBarIconOnly) return null
+        return bottomArtwork.iconCenter(index)?.let { hostHeight / 2f - transformDy - it * transformScale }
+    }
+
+    override fun followingNativeNavigationAnimation(now: Long): Boolean =
+        TiebaNativeTabAnimation.isFollowing(glassHost.navigationSource, now)
+
+    override fun skipNavigationSnapshotCapture(
+        source: ViewGroup,
+        snapshot: android.graphics.Bitmap?,
+        touching: Boolean,
+        visualAnimating: Boolean,
+        slotCount: Int,
+        now: Long,
+    ): Boolean? {
+        if (!TiebaNativeTabAnimation.isFollowing(source, now)) return null
+        if (snapshot != null && now - lastAnimatedCapture < 32L) return true
+        lastAnimatedCapture = now
+        glassHost.postInvalidateDelayed(32L)
+        return false
+    }
 
     override fun suppressNativeChrome(source: ViewGroup?) {
         glassHost.suppressNativeTiebaBottomBar(source)
@@ -28,6 +102,7 @@ internal class TiebaNavigationState(private val glassHost: GlassHostLayout) : Ap
         val now = SystemClock.uptimeMillis()
         if (now - lastProbeAt >= 240L) {
             lastProbeAt = now
+            updatePublishArtwork(source)
             recommendControl = replaceControl(recommendControl,
                 findLabel(root) { text -> RECOMMEND_LABELS.any(text::contains) }
                     ?.let { findBottomControl(it, root, glassHost.resources.displayMetrics.density) })
@@ -40,9 +115,95 @@ internal class TiebaNavigationState(private val glassHost: GlassHostLayout) : Ap
     }
 
     override fun dispose() {
+        bottomGradient.clear()
+        feedBottomInsets.restore()
+        bottomArtwork.clear()
+        publishArtwork?.alpha = publishAlpha
+        publishArtwork = null
         baseTranslations.forEach { (view, base) -> if (view.isAttachedToWindow) view.translationY = base }
         baseTranslations.clear(); recommendControl = null; liveSearchControl = null
         clearedBottomBlocks.clear(); lastProbeAt = 0L; lastBlockScanAt = 0L
+    }
+
+    private fun updatePublishArtwork(source: ViewGroup?) {
+        if (publishArtwork?.isAttachedToWindow == true) return
+        publishArtwork = null
+        if (source == null || source.childCount != 5 || !source.getChildAt(2).hasOnClickListeners()) return
+        var parent = source.parent as? ViewGroup
+        repeat(5) {
+            val container = parent ?: return
+            val matches = (0 until container.childCount).map(container::getChildAt)
+                .filterIsInstance<FrameLayout>()
+                .filter { candidate ->
+                    val childTypes = (0 until candidate.childCount)
+                        .map { candidate.getChildAt(it).javaClass.name }
+                    PUBLISH_ARTWORK_TYPES.all(childTypes::contains)
+                }
+            if (matches.size > 1) return
+            matches.singleOrNull()?.let {
+                publishAlpha = it.alpha
+                publishArtwork = it
+                it.alpha = 0f
+                android.util.Log.i("LiquidTabTieba", "Bound native bottom publish artwork")
+                return
+            }
+            parent = container.parent as? ViewGroup
+        }
+    }
+
+    override fun drawForeground(
+        canvas: Canvas,
+        frame: AdapterNavigationFrame,
+        selectionPath: Path,
+        drawSource: () -> Unit,
+    ): Boolean {
+        val mix = frame.navigationOpticalMix.coerceIn(0f, 1f)
+        if (mix <= 0f || selectionPath.isEmpty || !bottomArtwork.opticalReady) {
+            drawSource()
+            drawPublish(canvas, frame)
+            return true
+        }
+        if (mix < 1f) {
+            val baseline = canvas.saveLayerAlpha(0f, 0f, frame.width.toFloat(), frame.height.toFloat(),
+                ((1f - mix) * 255f).toInt())
+            drawSource()
+            if (frame.barLayout == null) drawPublish(canvas, frame)
+            canvas.restoreToCount(baseline)
+        }
+        val outside = canvas.save()
+        canvas.clipOutPath(selectionPath)
+        val fade = if (mix < 1f) canvas.saveLayerAlpha(0f, 0f, frame.width.toFloat(), frame.height.toFloat(),
+            (mix * 255f).toInt()) else -1
+        bottomArtwork.drawOptical(canvas, frame, selected = false)
+        if (frame.barLayout == null) drawPublish(canvas, frame)
+        if (fade >= 0) canvas.restoreToCount(fade)
+        canvas.restoreToCount(outside)
+        if (frame.barLayout != null) drawPublish(canvas, frame)
+        return true
+    }
+
+    private fun drawPublish(canvas: Canvas, frame: AdapterNavigationFrame) {
+        if (publishArtwork?.isAttachedToWindow != true) return
+        val layout = frame.barLayout
+        if (layout == null && 2 !in frame.enabledIndices) return
+        val x = layout?.let { it.actionLeft + it.actionSize / 2f }
+            ?: frame.width * (frame.enabledIndices.indexOf(2) + 0.5f) / frame.enabledIndices.size
+        val y = frame.height / 2f
+        if (layout == null) {
+            publishPaint.style = Paint.Style.FILL
+            publishPaint.color = TIEBA_PUBLISH_BLUE
+            val halfWidth = 16f * frame.density * TiebaAdapter.TAB_ICON_SCALE
+            val halfHeight = 12f * frame.density * TiebaAdapter.TAB_ICON_SCALE
+            canvas.drawRoundRect(x - halfWidth, y - halfHeight, x + halfWidth, y + halfHeight,
+                8f * frame.density, 8f * frame.density, publishPaint)
+        }
+        publishPaint.style = Paint.Style.STROKE
+        publishPaint.strokeCap = Paint.Cap.ROUND
+        publishPaint.strokeWidth = 2f * frame.density * TiebaAdapter.TAB_ICON_SCALE
+        publishPaint.color = Color.WHITE
+        val arm = 6f * frame.density * TiebaAdapter.TAB_ICON_SCALE
+        canvas.drawLine(x - arm, y, x + arm, y, publishPaint)
+        canvas.drawLine(x, y - arm, x, y + arm, publishPaint)
     }
 
     private fun findLabel(root: ViewGroup, matches: (String) -> Boolean): View? {
@@ -119,6 +280,10 @@ internal class TiebaNavigationState(private val glassHost: GlassHostLayout) : Ap
     }
 
     private companion object {
+        val PUBLISH_ARTWORK_TYPES = setOf(
+            "com.baidu.tbadk.widget.lottie.TBLottieAnimationView",
+            "com.baidu.tbadk.widget.TbImageView",
+        )
         val RECOMMEND_LABELS = arrayOf("单列浏览", "修改浏览设置", "浏览设置")
         val LIVE_SEARCH_LABELS = arrayOf("搜索你想看的直播", "搜你想看")
     }

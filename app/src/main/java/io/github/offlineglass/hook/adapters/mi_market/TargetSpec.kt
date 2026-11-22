@@ -9,5 +9,5 @@ internal val targetSpec: TargetSpec = TargetSpec("mi_market", "com.xiaomi.market
             activityHints = setOf("com.xiaomi.market.business_ui.main.MarketTabActivity"),
             idHints = setOf("tab_container", "tab_container_layout"),
             classHints = setOf("com.xiaomi.market.widget.BottomTabLayout", "MarketTabActivity"),
-            textHints = setOf("首页", "游戏", "应用", "榜单", "我的"), preferredSlots = 5..5,
-            defaultAccentColor = 0xFFFF765B.toInt(), entryLabels = listOf("首页", "游戏", "应用", "榜单", "我的"), hookSignals = hookSignals(), drawsNavigationInOptics = true, glassAccentColor = 0xFFFF765B.toInt(), sceneVisibilityAnimation = true)
+            textHints = setOf("首页", "榜单", "我的"), preferredSlots = 3..3,
+            defaultAccentColor = 0xFFFF6900.toInt(), entryLabels = listOf("首页", "我", "搜索"), hookSignals = hookSignals(), drawsNavigationInOptics = true, glassAccentColor = 0xFFFF6900.toInt(), sceneVisibilityAnimation = true)

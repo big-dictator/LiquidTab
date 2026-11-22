@@ -6,7 +6,12 @@ import android.view.ViewGroup
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
 import java.util.WeakHashMap
 
-/** Video and Star retain opaque footer plates and native viewport reservations. */
+/**
+ * Video and Star retain opaque footer plates and native viewport reservations.
+ *
+ * Pages, reserve holders, the footer plate and the recycler are located through
+ * semantic class anchors and LayoutParams structure — not obfuscated entry names.
+ */
 internal class QqMusicContentInsets {
     private val margins = WeakHashMap<View, Int>()
     private val paddings = WeakHashMap<ViewGroup, Pair<Int, Boolean>>()
@@ -26,8 +31,7 @@ internal class QqMusicContentInsets {
             return
         }
         val root = source.rootView
-        val pagerId = QqMusicNativeChrome.id(root, "main_desk_fragment_pager")
-        val pager = root.findViewById<ViewGroup>(pagerId) ?: return
+        val pager = QqMusicBinding.findEntry(root, "main_desk_fragment_pager") as? ViewGroup ?: return
         // The main pager reserve belongs to the old solid navigation on every tab.
         // Internal page corrections below remain specific to Video and Star.
         if (pageIndex != 1 && pageIndex != 3) {
@@ -37,12 +41,11 @@ internal class QqMusicContentInsets {
             return
         }
         val rect = Rect()
-        val page = (0 until pager.childCount).map(pager::getChildAt).firstOrNull { child ->
+        val page = (0 until pager.childCount).map(pager::getChildAt).singleOrNull { child ->
             child.getGlobalVisibleRect(rect) && !rect.isEmpty &&
                 AdapterNavigationSearch.findFirst(child) {
-                    if (pageIndex == 1) AdapterNavigationSearch.resourceEntryName(it) == "fck" &&
-                        it.javaClass.name.endsWith(".MainDesckChildViewPager")
-                    else it.javaClass.name == "com.tencent.qqmusic.ui.DiscoveryDeskTitleTabViewNew"
+                    if (pageIndex == 1) it.javaClass.name == QqMusicBinding.MAIN_CHILD_PAGER_CLASS
+                    else it.javaClass.name == QqMusicBinding.DISCOVERY_TAB_CLASS
                 } != null
         } ?: return
         val stack = ArrayDeque<View>()
@@ -51,17 +54,23 @@ internal class QqMusicContentInsets {
         var recycler: ViewGroup? = null
         while (stack.isNotEmpty()) {
             val view = stack.removeLast()
-            val name = AdapterNavigationSearch.resourceEntryName(view)
-            if ((name == (if (pageIndex == 1) "fck" else "b_u") && view.javaClass.name.endsWith(".MainDesckChildViewPager")) ||
-                (pageIndex == 3 && name == "h6x" && (view.parent as? View)?.let {
-                    AdapterNavigationSearch.resourceEntryName(it) == "h7h"
-                } == true)) targets.add(view)
-            // VideoLiveFragment's footer is a separate native View, not the glass host.
-            if (pageIndex == 1 && name == "bts" && view.javaClass == View::class.java) {
+            // Reserve holders are full-height content views keeping the old nav margin.
+            if (view is ViewGroup && view.javaClass.name == QqMusicBinding.MAIN_CHILD_PAGER_CLASS &&
+                view.layoutParams?.height == ViewGroup.LayoutParams.MATCH_PARENT &&
+                (view.layoutParams as? ViewGroup.MarginLayoutParams)?.bottomMargin?.let { it > 0 } == true
+            ) {
+                targets.add(view)
+            }
+            // VideoLiveFragment's footer is a bare native View, not the glass host.
+            if (pageIndex == 1 && QqMusicBinding.isVideoFooter(view, page)) {
                 plates.getOrPut(view) { view.visibility }
                 view.visibility = View.INVISIBLE
             }
-            if (name == "gl4" && view is ViewGroup && view.getGlobalVisibleRect(rect) && !rect.isEmpty) recycler = view
+            if (view.javaClass.name == QqMusicBinding.MUSIC_HALL_RECYCLER_CLASS && view is ViewGroup &&
+                view.getGlobalVisibleRect(rect) && !rect.isEmpty
+            ) {
+                recycler = view
+            }
             if (view is ViewGroup) for (i in 0 until view.childCount) stack.add(view.getChildAt(i))
         }
         targets.add(pager)

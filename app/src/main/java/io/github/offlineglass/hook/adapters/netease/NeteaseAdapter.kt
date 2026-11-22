@@ -1,11 +1,14 @@
 package io.github.offlineglass.hook.adapters.netease
 
 import android.view.View
+import android.view.ViewGroup
 import android.content.Context
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
-import de.robv.android.xposed.XposedHelpers
-import de.robv.android.xposed.callbacks.XC_LoadPackage
+import android.app.Activity
+import android.os.Bundle
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
+import io.github.offlineglass.hook.compat.XposedHelpers
+import io.github.offlineglass.hook.compat.callbacks.XC_LoadPackage
 import io.github.offlineglass.hook.NavigationCandidate
 import io.github.offlineglass.hook.adapters.AdapterNavigationSearch
 import io.github.offlineglass.hook.adapters.TargetAdapter
@@ -16,6 +19,11 @@ import io.github.offlineglass.targets.TargetSpec
 internal object NeteaseAdapter : TargetAdapter {
     private val viewportHookedClasses = HashSet<Class<*>>()
     override val key = "netease"
+    override fun surfaceOpacityScale(config: io.github.offlineglass.config.GlassConfig) = config.spotifyBarOpacity
+    // The same finder can return a mini-player outside the home navigation.
+    // Playback/queue actions are not page visits and must remain immediate.
+    override fun isFirstVisitPage(source: ViewGroup, index: Int, slots: Int): Boolean =
+        source.javaClass.name == "com.netease.cloudmusic.theme.ui.NavigationTabLayout"
     // The mini-player skin and 心动-page state are maintained from the host's
     // pre-draw callback. Keep that callback enabled after moving them here.
     override val hasPerFrameScene = true
@@ -46,13 +54,14 @@ internal object NeteaseAdapter : TargetAdapter {
     }
 
     override fun hookSignals() = listOf(
-        TargetHookSignal("com.netease.cloudmusic.theme.ui.NavigationTabLayout", listOf("onAttachedToWindow", "t")),
+        TargetHookSignal("com.netease.cloudmusic.theme.ui.NavigationTabLayout", listOf("onAttachedToWindow")),
         TargetHookSignal("com.netease.cloudmusic.activity.MainActivity", listOf("onDrawerOpened", "onDrawerClosed")),
         TargetHookSignal("com.netease.cloudmusic.music.biz.recentplay.ui.activity.MyRecentPlayActivity", listOf("onCreate", "onResume")),
         TargetHookSignal("com.netease.cloudmusic.music.biz.rn.activity.MainProcessRNActivity", listOf("onCreate", "onResume")),
     )
 
     override fun installHooks(lpparam: XC_LoadPackage.LoadPackageParam, spec: TargetSpec) {
+        installSplashAdHooks(lpparam.classLoader)
         // These two exact promo views own the image/colour plate above the
         // mini-player. Hiding only their text leaves that plate behind.
         val promoTypes = listOf(
@@ -78,19 +87,8 @@ internal object NeteaseAdapter : TargetAdapter {
                 }
             })
         }
-        // Reject renewal slots before they create their image-backed popup.
-        for (pluginName in listOf("vh0.d0", "vh0.e")) runCatching {
-            val plugin = Class.forName(pluginName, false, lpparam.classLoader)
-            plugin.declaredMethods.filter {
-                it.returnType == Boolean::class.javaPrimitiveType && it.parameterTypes.size == 1 &&
-                    (it.parameterTypes[0].simpleName == "MinibarUiResourceState" ||
-                        it.parameterTypes[0] == Any::class.java)
-            }.map { it.name }.distinct().forEach { method ->
-                XposedBridge.hookAllMethods(plugin, method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) { param.result = false }
-                })
-            }
-        }
+        // Bind the stable, semantic promotion views. Their plugin class names
+        // are obfuscated and change independently of the view contract.
         runCatching {
             val guide = Class.forName(
                 "com.netease.cloudmusic.module.minibar.widget.VipRenewPopupMinibarGuideView",
@@ -145,6 +143,56 @@ internal object NeteaseAdapter : TargetAdapter {
             XposedBridge.hookAllMethods(banner, "onBindData", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     (param.thisObject as? View)?.let(NeteasePromoVisibilityGuard::hideAdContainer)
+                }
+            })
+        }
+    }
+
+    private fun installSplashAdHooks(loader: ClassLoader) {
+        // The loading page has two independent visual callbacks: an AdInfo
+        // fragment and a launcher photograph. Both belong to the same native
+        // loading delegate, whose delay route is identified by its full type
+        // signature. Keep the native redirect/login decision in that delegate.
+        runCatching {
+            val loading = Class.forName("com.netease.cloudmusic.activity.LoadingActivity", false, loader)
+            val adInfo = Class.forName("com.netease.cloudmusic.module.ad.meta.AdInfo", false, loader)
+            val launcherPhoto = Class.forName(
+                "com.netease.cloudmusic.module.launcher.model.LauncherPhotoResource", false, loader,
+            )
+            val adCallbacks = loading.declaredMethods.filter { method ->
+                method.returnType == Void.TYPE && method.parameterTypes.contentEquals(
+                    arrayOf(adInfo, Int::class.javaPrimitiveType, Long::class.javaPrimitiveType))
+            }
+            val photoCallbacks = loading.declaredMethods.filter { method ->
+                method.returnType == Void.TYPE && method.parameterTypes.contentEquals(arrayOf(launcherPhoto))
+            }
+            val continueRoutes = loading.declaredMethods.filter { method ->
+                method.returnType == Void.TYPE && method.parameterTypes.contentEquals(
+                    arrayOf(Long::class.javaPrimitiveType, String::class.java, adInfo, Boolean::class.javaPrimitiveType))
+            }
+            if (adCallbacks.size == 1 && photoCallbacks.size == 1 && continueRoutes.size == 1) {
+                val continueRoute = continueRoutes.single().apply { isAccessible = true }
+                val skipVisual = object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val activity = param.thisObject as? Activity ?: return
+                        if (activity.isFinishing) return
+                        if (runCatching {
+                            continueRoute.invoke(activity, 0L, "liquidtab_skip_launch_ad", null, true)
+                        }.isSuccess) param.result = null
+                    }
+                }
+                XposedBridge.hookMethod(adCallbacks.single(), skipVisual)
+                XposedBridge.hookMethod(photoCallbacks.single(), skipVisual)
+            }
+        }
+        runCatching {
+            val adActivity = Class.forName("com.netease.cloudmusic.activity.LoadingAdActivity", false, loader)
+            XposedBridge.hookAllMethods(adActivity, "onCreate", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    (param.thisObject as? Activity)?.window?.decorView?.alpha = 0f
+                }
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    (param.thisObject as? Activity)?.finish()
                 }
             })
         }

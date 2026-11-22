@@ -6,6 +6,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
+import io.github.offlineglass.hook.adapters.localizeNavigationLabel
 import androidx.core.graphics.PathParser
 import io.github.offlineglass.hook.adapters.AdapterNavigationFrame
 
@@ -41,7 +42,7 @@ internal object BilibiliRenderer {
         typeface = Typeface.create("sans-serif", Typeface.NORMAL)
     }
 
-    fun draw(canvas: Canvas, frame: AdapterNavigationFrame) {
+    fun draw(canvas: Canvas, frame: AdapterNavigationFrame, searchPress: Float = 0f) {
         with(frame) {
             if (slotCount != 5 || width <= 0 || height <= 0) return
             val horizontalPadding = 4f * density
@@ -53,8 +54,32 @@ internal object BilibiliRenderer {
             val groupTop = baseIconCenterY - iconSize / 2f
             val groupBottom = baseLabelBaseline + labelPaint.fontMetrics.bottom
             val groupOffsetY = height / 2f - (groupTop + groupBottom) / 2f
-            val iconCenterY = baseIconCenterY + groupOffsetY
+            val iconCenterY = if (iconOnly) height / 2f else baseIconCenterY + groupOffsetY
             val labelBaseline = baseLabelBaseline + groupOffsetY
+            val detached = barLayout
+            if (detached != null && !hideSelectedForOptics) {
+                val cx = detached.actionLeft + detached.actionSize / 2f
+                val cy = height / 2f
+                iconPaint.color = if (darkGlass) Color.WHITE else Color.rgb(44, 44, 44)
+                iconPaint.style = Paint.Style.STROKE
+                iconPaint.strokeCap = Paint.Cap.ROUND
+                if (detached.actionIndex == BilibiliAdapter.SEARCH_INDEX) {
+                    val save = canvas.save()
+                    val scale = 1f + .08f * searchPress
+                    canvas.scale(scale, scale, cx, cy)
+                    val d = density * 1.15f
+                    iconPaint.strokeWidth = 1.8f * d
+                    canvas.drawCircle(cx - 1.25f*d, cy - 1.25f*d, 6.5f*d, iconPaint)
+                    canvas.drawLine(cx + 3.4f*d, cy + 3.4f*d, cx + 8.2f*d, cy + 8.2f*d, iconPaint)
+                    canvas.restoreToCount(save)
+                } else {
+                    iconPaint.strokeWidth = 2.6f * density
+                    val half = minOf(9f * density, detached.actionSize * 0.17f)
+                    canvas.drawLine(cx - half, cy, cx + half, cy, iconPaint)
+                    canvas.drawLine(cx, cy - half, cx, cy + half, iconPaint)
+                }
+                iconPaint.style = Paint.Style.FILL
+            }
             for ((visualIndex, index) in enabledIndices.withIndex()) {
                 if (index !in 0..4) continue
                 val centerX = horizontalPadding + (visualIndex + 0.5f) * slotWidth
@@ -77,7 +102,7 @@ internal object BilibiliRenderer {
                     continue
                 }
                 val pathIndex = if (index < PUBLISH_INDEX) index else index - 1
-                val selected = index == selectedIndex
+                val selected = hideSelectedForOptics
                 val path = if (selected) selectedPaths[pathIndex] else normalPaths[pathIndex]
                 iconPaint.color = if (selected) ACCENT else unselectedColor
                 canvas.save()
@@ -87,7 +112,7 @@ internal object BilibiliRenderer {
                 canvas.restore()
                 if (!iconOnly) {
                     labelPaint.color = if (selected) ACCENT else unselectedColor
-                    canvas.drawText(labels[index], centerX, labelBaseline, labelPaint)
+                    canvas.drawText(localizeNavigationLabel(labels[index]), centerX, labelBaseline, labelPaint)
                 }
                 canvas.restore()
             }

@@ -2,8 +2,8 @@ package io.github.offlineglass.hook.adapters.douyin
 
 import android.view.View
 import android.view.ViewGroup
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
+import io.github.offlineglass.hook.compat.XC_MethodHook
+import io.github.offlineglass.hook.compat.XposedBridge
 import java.util.WeakHashMap
 
 /** Keep an adapter-owned controls margin intact before native remeasurement. */
